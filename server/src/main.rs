@@ -94,6 +94,12 @@ struct NodeCoord {
     lng: f32,
 }
 
+#[derive(Clone, Copy)]
+struct AdminCandidate<'a> {
+    area: f32,
+    poly: &'a AdminPolygon,
+}
+
 // --- Index data ---
 
 struct Index {
@@ -439,60 +445,67 @@ impl Index {
             )
         };
 
-        // For each admin level, find the smallest-area polygon containing the point
-        let mut best_by_level: [Option<(f32, &AdminPolygon)>; 12] = [None; 12];
+        let mut candidates_by_level: [Vec<AdminCandidate<'_>>; 12] = std::array::from_fn(|_| Vec::new());
 
-        const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry(&self.admin_entries, Self::lookup_offset_cell(&self.admin_cells, c), |id| {
-                let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
                 let poly = &all_polygons[poly_id];
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
 
-                // Skip if we already have a smaller polygon at this level
-                if let Some((best_area, _)) = best_by_level[level] {
-                    if poly.area >= best_area { return; }
+                if !polygon_contains_point(poly, all_vertices, lat as f32, lng as f32) {
+                    return;
                 }
 
-                // Interior cells skip point-in-polygon test
-                if is_interior || point_in_polygon(lat as f32, lng as f32, {
-                    let offset = poly.vertex_offset as usize;
-                    let count = poly.vertex_count as usize;
-                    &all_vertices[offset..offset + count]
-                }) {
-                    best_by_level[level] = Some((poly.area, poly));
+                if candidates_by_level[level]
+                    .iter()
+                    .any(|candidate| std::ptr::eq(candidate.poly, poly))
+                {
+                    return;
                 }
+
+                candidates_by_level[level].push(AdminCandidate { area: poly.area, poly });
             });
         }
 
         let mut result = AdminResult::default();
+        let city = select_admin_candidate(&candidates_by_level[8], None, all_vertices);
+        let county = select_admin_candidate(&candidates_by_level[6], city, all_vertices);
+        let city_district = select_admin_candidate(&candidates_by_level[9], city, all_vertices);
+        let suburb = select_admin_candidate(&candidates_by_level[10], city.or(city_district), all_vertices);
+        let state = select_admin_candidate(&candidates_by_level[4], city.or(county), all_vertices);
+        let country = select_admin_candidate(&candidates_by_level[2], state.or(city).or(county), all_vertices);
+        let postcode = select_admin_candidate(&candidates_by_level[11], None, all_vertices);
 
-        for level in 0..12 {
-            if let Some((_, poly)) = best_by_level[level] {
-                let name = self.get_string(poly.name_id);
-                match poly.admin_level {
-                    2 => {
-                        result.country = Some(name);
-                        if poly.country_code != 0 {
-                            result.country_code = Some([
-                                (poly.country_code >> 8) as u8,
-                                (poly.country_code & 0xFF) as u8,
-                            ]);
-                        }
-                    }
-                    4 => result.state = Some(name),
-                    6 => result.county = Some(name),
-                    8 => result.city = Some(name),
-                    9 => result.city_district = Some(name),
-                    10 => result.suburb = Some(name),
-                    11 => result.postcode = Some(name),
-                    _ => {}
-                }
+        if let Some(poly) = country {
+            result.country = Some(self.get_string(poly.name_id));
+            if poly.country_code != 0 {
+                result.country_code = Some([
+                    (poly.country_code >> 8) as u8,
+                    (poly.country_code & 0xFF) as u8,
+                ]);
             }
+        }
+        if let Some(poly) = state {
+            result.state = Some(self.get_string(poly.name_id));
+        }
+        if let Some(poly) = county {
+            result.county = Some(self.get_string(poly.name_id));
+        }
+        if let Some(poly) = city {
+            result.city = Some(self.get_string(poly.name_id));
+        }
+        if let Some(poly) = city_district {
+            result.city_district = Some(self.get_string(poly.name_id));
+        }
+        if let Some(poly) = suburb {
+            result.suburb = Some(self.get_string(poly.name_id));
+        }
+        if let Some(poly) = postcode {
+            result.postcode = Some(self.get_string(poly.name_id));
         }
 
         result
@@ -683,6 +696,106 @@ fn point_to_segment_distance(
     cos_lat: f64,
 ) -> f64 {
     point_to_segment_with_t(px, py, ax, ay, bx, by, cos_lat).0
+}
+
+fn polygon_vertices<'a>(poly: &AdminPolygon, vertices: &'a [NodeCoord]) -> &'a [NodeCoord] {
+    let offset = poly.vertex_offset as usize;
+    let count = poly.vertex_count as usize;
+    &vertices[offset..offset + count]
+}
+
+fn polygon_contains_point(poly: &AdminPolygon, vertices: &[NodeCoord], lat: f32, lng: f32) -> bool {
+    point_in_polygon(lat, lng, polygon_vertices(poly, vertices))
+}
+
+fn polygon_centroid(vertices: &[NodeCoord]) -> Option<(f32, f32)> {
+    if vertices.len() < 3 {
+        return None;
+    }
+
+    let mut twice_area = 0.0f64;
+    let mut cx = 0.0f64;
+    let mut cy = 0.0f64;
+
+    for i in 0..vertices.len() {
+        let j = (i + 1) % vertices.len();
+        let cross = vertices[i].lng as f64 * vertices[j].lat as f64
+            - vertices[j].lng as f64 * vertices[i].lat as f64;
+        twice_area += cross;
+        cx += (vertices[i].lng as f64 + vertices[j].lng as f64) * cross;
+        cy += (vertices[i].lat as f64 + vertices[j].lat as f64) * cross;
+    }
+
+    if twice_area.abs() < f64::EPSILON {
+        return None;
+    }
+
+    Some(((cy / (3.0 * twice_area)) as f32, (cx / (3.0 * twice_area)) as f32))
+}
+
+fn polygon_compatibility_score(
+    candidate: &AdminPolygon,
+    child: &AdminPolygon,
+    vertices: &[NodeCoord],
+) -> usize {
+    let candidate_vertices = polygon_vertices(candidate, vertices);
+    let child_vertices = polygon_vertices(child, vertices);
+    let mut score = 0usize;
+
+    if let Some((lat, lng)) = polygon_centroid(child_vertices) {
+        if point_in_polygon(lat, lng, candidate_vertices) {
+            score += 100;
+        }
+    }
+
+    let step = (child_vertices.len() / 16).max(1);
+    for vertex in child_vertices.iter().step_by(step).take(16) {
+        if point_in_polygon(vertex.lat, vertex.lng, candidate_vertices) {
+            score += 1;
+        }
+    }
+
+    score
+}
+
+fn select_admin_candidate<'a>(
+    candidates: &[AdminCandidate<'a>],
+    child: Option<&AdminPolygon>,
+    vertices: &[NodeCoord],
+) -> Option<&'a AdminPolygon> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| a.area.total_cmp(&b.area));
+
+    if let Some(child) = child {
+        let mut best: Option<(usize, f32, &AdminPolygon)> = None;
+        for candidate in &sorted {
+            let score = polygon_compatibility_score(candidate.poly, child, vertices);
+            if score == 0 {
+                continue;
+            }
+
+            let replace = match best {
+                Some((best_score, best_area, _)) => {
+                    score > best_score || (score == best_score && candidate.area < best_area)
+                }
+                None => true,
+            };
+
+            if replace {
+                best = Some((score, candidate.area, candidate.poly));
+            }
+        }
+
+        if let Some((_, _, poly)) = best {
+            return Some(poly);
+        }
+    }
+
+    sorted.first().map(|candidate| candidate.poly)
 }
 
 // Ray casting point-in-polygon test
@@ -906,6 +1019,113 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     }
 
     if parts.is_empty() { None } else { Some(parts.join(", ")) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NAME_PERNAMBUCO: u32 = 1;
+    const NAME_PARAIBA: u32 = 2;
+    const NAME_SANTA_TEREZINHA: u32 = 3;
+
+    fn add_polygon(
+        vertices: &mut Vec<NodeCoord>,
+        points: &[(f32, f32)],
+        name_id: u32,
+        admin_level: u8,
+        area: f32,
+    ) -> AdminPolygon {
+        let vertex_offset = vertices.len() as u32;
+        vertices.extend(points.iter().map(|(lat, lng)| NodeCoord {
+            lat: *lat,
+            lng: *lng,
+        }));
+        AdminPolygon {
+            vertex_offset,
+            vertex_count: points.len() as u16,
+            name_id,
+            admin_level,
+            area,
+            country_code: 0,
+        }
+    }
+
+    #[test]
+    fn regression_border_state_prefers_pernambuco_for_santa_terezinha_coordinate() {
+        let query_lat = -7.373068f32;
+        let query_lng = -37.480312f32;
+        let mut vertices = Vec::new();
+
+        let city = add_polygon(
+            &mut vertices,
+            &[
+                (-7.3780, -37.4820),
+                (-7.3780, -37.4650),
+                (-7.3620, -37.4650),
+                (-7.3620, -37.4820),
+            ],
+            NAME_SANTA_TEREZINHA,
+            8,
+            0.001,
+        );
+        let pernambuco = add_polygon(
+            &mut vertices,
+            &[
+                (-7.5000, -37.6500),
+                (-7.5000, -37.3500),
+                (-7.2500, -37.3500),
+                (-7.2500, -37.6500),
+            ],
+            NAME_PERNAMBUCO,
+            4,
+            10.0,
+        );
+        let paraiba = add_polygon(
+            &mut vertices,
+            &[
+                (-7.3850, -37.4850),
+                (-7.3850, -37.4780),
+                (-7.3650, -37.4780),
+                (-7.3650, -37.4850),
+            ],
+            NAME_PARAIBA,
+            4,
+            0.0001,
+        );
+
+        assert!(polygon_contains_point(&city, &vertices, query_lat, query_lng));
+        assert!(polygon_contains_point(&pernambuco, &vertices, query_lat, query_lng));
+        assert!(polygon_contains_point(&paraiba, &vertices, query_lat, query_lng));
+
+        let selected_city = select_admin_candidate(
+            &[AdminCandidate {
+                area: city.area,
+                poly: &city,
+            }],
+            None,
+            &vertices,
+        )
+        .unwrap();
+        let selected_state = select_admin_candidate(
+            &[
+                AdminCandidate {
+                    area: paraiba.area,
+                    poly: &paraiba,
+                },
+                AdminCandidate {
+                    area: pernambuco.area,
+                    poly: &pernambuco,
+                },
+            ],
+            Some(selected_city),
+            &vertices,
+        )
+        .unwrap();
+
+        assert_eq!(selected_city.name_id, NAME_SANTA_TEREZINHA);
+        assert_eq!(selected_state.name_id, NAME_PERNAMBUCO);
+    }
 }
 
 #[derive(Deserialize)]
