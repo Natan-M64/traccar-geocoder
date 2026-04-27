@@ -61,6 +61,13 @@ struct AdminPolygon {
     uint16_t country_code;
 };
 
+struct PlacePoint {
+    float lat;
+    float lng;
+    uint32_t name_id;
+    uint8_t place_type;
+};
+
 struct NodeCoord {
     float lat;
     float lng;
@@ -68,6 +75,13 @@ struct NodeCoord {
 
 static const uint32_t INTERIOR_FLAG = 0x80000000u;
 static const uint32_t ID_MASK = 0x7FFFFFFFu;
+
+enum PlaceType : uint8_t {
+    PLACE_SUBURB = 1,
+    PLACE_NEIGHBOURHOOD = 2,
+    PLACE_QUARTER = 3,
+    PLACE_CITY_DISTRICT = 4,
+};
 
 // --- String interning ---
 
@@ -115,6 +129,10 @@ static std::vector<AdminPolygon> admin_polygons;
 static std::vector<NodeCoord> admin_vertices;
 static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
+// Place points
+static std::vector<PlacePoint> place_points;
+static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_places;
+
 // --- S2 helpers ---
 
 static int kStreetCellLevel = 17;
@@ -141,6 +159,10 @@ static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, d
 
 static S2CellId point_to_cell(double lat, double lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel);
+}
+
+static S2CellId point_to_admin_cell(double lat, double lng) {
+    return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
 }
 
 // Returns pairs of (cell_id, is_interior)
@@ -357,6 +379,15 @@ static uint32_t parse_house_number(const char* s) {
     return n;
 }
 
+static uint8_t parse_place_type(const char* place) {
+    if (!place) return 0;
+    if (std::strcmp(place, "suburb") == 0) return PLACE_SUBURB;
+    if (std::strcmp(place, "neighbourhood") == 0) return PLACE_NEIGHBOURHOOD;
+    if (std::strcmp(place, "quarter") == 0) return PLACE_QUARTER;
+    if (std::strcmp(place, "city_district") == 0) return PLACE_CITY_DISTRICT;
+    return 0;
+}
+
 // --- Add an address point ---
 
 static uint64_t addr_count_total = 0;
@@ -377,6 +408,19 @@ static void add_addr_point(double lat, double lng, const char* housenumber, cons
     if (addr_count_total % 1000000 == 0) {
         std::cerr << "Collected " << addr_count_total / 1000000 << "M addresses..." << std::endl;
     }
+}
+
+static void add_place_point(double lat, double lng, const char* name, uint8_t place_type) {
+    uint32_t place_id = static_cast<uint32_t>(place_points.size());
+    place_points.push_back({
+        static_cast<float>(lat),
+        static_cast<float>(lng),
+        strings.intern(name),
+        place_type
+    });
+
+    S2CellId cell = point_to_admin_cell(lat, lng);
+    cell_to_places[cell.id()].push_back(place_id);
 }
 
 // --- Add an admin polygon ---
@@ -420,11 +464,18 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
 class BuildHandler : public osmium::handler::Handler {
 public:
     void node(const osmium::Node& node) {
+        if (!node.location().valid()) return;
+
+        const char* name = node.tags()["name"];
+        uint8_t place_type = parse_place_type(node.tags()["place"]);
+        if (name && place_type != 0) {
+            process_place(node, name, place_type);
+        }
+
         const char* housenumber = node.tags()["addr:housenumber"];
         if (!housenumber) return;
         const char* street = node.tags()["addr:street"];
         if (!street) return;
-        if (!node.location().valid()) return;
 
         add_addr_point(node.location().lat(), node.location().lon(), housenumber, street);
     }
@@ -517,12 +568,23 @@ public:
     uint64_t building_addr_count() const { return building_addr_count_; }
     uint64_t interp_count() const { return interp_count_; }
     uint64_t admin_count() const { return admin_count_; }
+    uint64_t place_count() const { return place_count_; }
 
 private:
     uint64_t way_count_ = 0;
     uint64_t building_addr_count_ = 0;
     uint64_t interp_count_ = 0;
     uint64_t admin_count_ = 0;
+    uint64_t place_count_ = 0;
+
+    void process_place(const osmium::Node& node, const char* name, uint8_t place_type) {
+        add_place_point(node.location().lat(), node.location().lon(), name, place_type);
+
+        place_count_++;
+        if (place_count_ % 100000 == 0) {
+            std::cerr << "Collected " << place_count_ / 1000 << "K place points..." << std::endl;
+        }
+    }
 
     void process_building_address(const osmium::Way& way, const char* housenumber, const char* street) {
         const auto& wnodes = way.nodes();
@@ -800,6 +862,9 @@ static void write_index(const std::string& output_dir) {
     write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
     std::cerr << "admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
 
+    write_cell_index(output_dir + "/place_cells.bin", output_dir + "/place_entries.bin", cell_to_places);
+    std::cerr << "place index: " << cell_to_places.size() << " cells, " << place_points.size() << " points" << std::endl;
+
     // Street ways
     {
         std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
@@ -840,6 +905,12 @@ static void write_index(const std::string& output_dir) {
     {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(admin_vertices.data()), admin_vertices.size() * sizeof(NodeCoord));
+    }
+
+    // Place points
+    {
+        std::ofstream f(output_dir + "/place_points.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(place_points.data()), place_points.size() * sizeof(PlacePoint));
     }
 
     // Strings
@@ -920,6 +991,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "  " << handler.interp_count() << " interpolation ways" << std::endl;
     std::cerr << "  " << handler.admin_count() << " admin/postcode boundaries ("
               << admin_polygons.size() << " polygon rings)" << std::endl;
+    std::cerr << "  " << handler.place_count() << " place points" << std::endl;
 
     std::cerr << "Resolving interpolation endpoints..." << std::endl;
     resolve_interpolation_endpoints();
@@ -929,6 +1001,7 @@ int main(int argc, char* argv[]) {
     deduplicate(cell_to_addrs);
     deduplicate(cell_to_interps);
     deduplicate(cell_to_admin);
+    deduplicate(cell_to_places);
 
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
     write_index(output_dir);

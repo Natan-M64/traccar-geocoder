@@ -18,6 +18,14 @@ use std::sync::{Arc, RwLock};
 const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
 const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
 const DEFAULT_SEARCH_DISTANCE: f64 = 75.0;
+const PLACE_SUBURB: u8 = 1;
+const PLACE_NEIGHBOURHOOD: u8 = 2;
+const PLACE_QUARTER: u8 = 3;
+const PLACE_CITY_DISTRICT: u8 = 4;
+const PLACE_SUBURB_MAX_DISTANCE: f64 = 5_000.0;
+const PLACE_NEIGHBOURHOOD_MAX_DISTANCE: f64 = 3_000.0;
+const PLACE_QUARTER_MAX_DISTANCE: f64 = 3_000.0;
+const PLACE_CITY_DISTRICT_MAX_DISTANCE: f64 = 5_000.0;
 
 fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
@@ -72,6 +80,15 @@ struct AdminPolygon {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct PlacePoint {
+    lat: f32,
+    lng: f32,
+    name_id: u32,
+    place_type: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct NodeCoord {
     lat: f32,
     lng: f32,
@@ -93,6 +110,9 @@ struct Index {
     admin_entries: Mmap,
     admin_polygons: Mmap,
     admin_vertices: Mmap,
+    place_cells: Option<Mmap>,
+    place_entries: Option<Mmap>,
+    place_points: Option<Mmap>,
     strings: Mmap,
     street_cell_level: u64,
     admin_cell_level: u64,
@@ -110,6 +130,22 @@ struct GeoCellOffsets {
 fn mmap_file(path: &str) -> Result<Mmap, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
     unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e)) }
+}
+
+fn mmap_optional_file(path: &str) -> Result<Option<Mmap>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Failed to open {}: {}", path, e)),
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| format!("Failed to stat {}: {}", path, e))?
+        .len();
+    if len == 0 {
+        return Ok(None);
+    }
+    unsafe { Mmap::map(&file).map(Some).map_err(|e| format!("Failed to mmap {}: {}", path, e)) }
 }
 
 impl Index {
@@ -130,6 +166,9 @@ impl Index {
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
             admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
+            place_cells: mmap_optional_file(&format!("{}/place_cells.bin", dir))?,
+            place_entries: mmap_optional_file(&format!("{}/place_entries.bin", dir))?,
+            place_points: mmap_optional_file(&format!("{}/place_points.bin", dir))?,
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
@@ -197,8 +236,8 @@ impl Index {
         empty
     }
 
-    // Binary search admin cell index: 12 bytes per entry (u64 cell_id + u32 offset)
-    fn lookup_admin_cell(cells: &[u8], cell_id: u64) -> u32 {
+    // Binary search cell index with a single entries offset: 12 bytes per entry (u64 cell_id + u32 offset)
+    fn lookup_offset_cell(cells: &[u8], cell_id: u64) -> u32 {
         let entry_size: usize = 12;
         let count = cells.len() / entry_size;
         if count == 0 { return NO_DATA; }
@@ -407,7 +446,7 @@ impl Index {
         const ID_MASK: u32 = 0x7FFFFFFF;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+            Self::for_each_entry(&self.admin_entries, Self::lookup_offset_cell(&self.admin_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
                 let poly = &all_polygons[poly_id];
@@ -448,10 +487,85 @@ impl Index {
                     4 => result.state = Some(name),
                     6 => result.county = Some(name),
                     8 => result.city = Some(name),
+                    9 => result.city_district = Some(name),
+                    10 => result.suburb = Some(name),
                     11 => result.postcode = Some(name),
                     _ => {}
                 }
             }
+        }
+
+        result
+    }
+
+    fn find_places(&self, lat: f64, lng: f64) -> PlaceResult<'_> {
+        let (Some(place_cells), Some(place_entries), Some(place_points)) =
+            (&self.place_cells, &self.place_entries, &self.place_points)
+        else {
+            return PlaceResult::default();
+        };
+
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+        let cos_lat = lat.to_radians().cos();
+
+        let all_points: &[PlacePoint] = unsafe {
+            std::slice::from_raw_parts(
+                place_points.as_ptr() as *const PlacePoint,
+                place_points.len() / std::mem::size_of::<PlacePoint>(),
+            )
+        };
+
+        let max_suburb_dist = meters_to_rad_sq(PLACE_SUBURB_MAX_DISTANCE);
+        let max_neighbourhood_dist = meters_to_rad_sq(PLACE_NEIGHBOURHOOD_MAX_DISTANCE);
+        let max_quarter_dist = meters_to_rad_sq(PLACE_QUARTER_MAX_DISTANCE);
+        let max_city_district_dist = meters_to_rad_sq(PLACE_CITY_DISTRICT_MAX_DISTANCE);
+
+        let mut result = PlaceResult::default();
+        let mut best_suburb: Option<f64> = None;
+        let mut best_neighbourhood: Option<f64> = None;
+        let mut best_quarter: Option<f64> = None;
+        let mut best_city_district: Option<f64> = None;
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(place_entries, Self::lookup_offset_cell(place_cells, c), |id| {
+                let Some(point) = all_points.get(id as usize) else {
+                    return;
+                };
+
+                let dlat = (lat - point.lat as f64).to_radians();
+                let dlng = (lng - point.lng as f64).to_radians();
+                let dist = dist_sq(dlat, dlng, cos_lat);
+                let name = self.get_string(point.name_id);
+
+                match point.place_type {
+                    PLACE_SUBURB if dist <= max_suburb_dist => {
+                        if best_suburb.is_none_or(|best| dist < best) {
+                            best_suburb = Some(dist);
+                            result.suburb = Some(name);
+                        }
+                    }
+                    PLACE_NEIGHBOURHOOD if dist <= max_neighbourhood_dist => {
+                        if best_neighbourhood.is_none_or(|best| dist < best) {
+                            best_neighbourhood = Some(dist);
+                            result.neighbourhood = Some(name);
+                        }
+                    }
+                    PLACE_QUARTER if dist <= max_quarter_dist => {
+                        if best_quarter.is_none_or(|best| dist < best) {
+                            best_quarter = Some(dist);
+                            result.quarter = Some(name);
+                        }
+                    }
+                    PLACE_CITY_DISTRICT if dist <= max_city_district_dist => {
+                        if best_city_district.is_none_or(|best| dist < best) {
+                            best_city_district = Some(dist);
+                            result.city_district = Some(name);
+                        }
+                    }
+                    _ => {}
+                }
+            });
         }
 
         result
@@ -462,7 +576,8 @@ impl Index {
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
         let max_dist = self.max_distance_sq;
 
-        let admin = self.find_admin(lat, lng);
+        let mut admin = self.find_admin(lat, lng);
+        let places = self.find_places(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
 
         // Pick whichever is closer: the nearest house (address point or
@@ -495,20 +610,38 @@ impl Index {
             road = Some(self.get_string(way.name_id));
         }
 
-        if road.is_none() && admin.country.is_none() && admin.city.is_none() {
-            return Address::default();
+        if admin.suburb.is_none() {
+            admin.suburb = places.suburb;
+        }
+        if admin.city_district.is_none() {
+            admin.city_district = places.city_district;
         }
 
-        let address = AddressDetails {
+        let mut address = AddressDetails {
             house_number,
             road,
             city: admin.city,
+            city_district: admin.city_district,
+            suburb: admin.suburb,
+            neighbourhood: places.neighbourhood,
+            quarter: places.quarter,
             state: admin.state,
             county: admin.county,
             postcode: admin.postcode,
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
+        dedupe_address_details(&mut address);
+        if address.road.is_none()
+            && address.suburb.is_none()
+            && address.neighbourhood.is_none()
+            && address.quarter.is_none()
+            && address.city_district.is_none()
+            && address.country.is_none()
+            && address.city.is_none()
+        {
+            return Address::default();
+        }
         let display_name = format_address(&address);
         Address { display_name, address }
     }
@@ -582,7 +715,17 @@ struct AdminResult<'a> {
     state: Option<&'a str>,
     county: Option<&'a str>,
     city: Option<&'a str>,
+    city_district: Option<&'a str>,
+    suburb: Option<&'a str>,
     postcode: Option<&'a str>,
+}
+
+#[derive(Default)]
+struct PlaceResult<'a> {
+    city_district: Option<&'a str>,
+    suburb: Option<&'a str>,
+    neighbourhood: Option<&'a str>,
+    quarter: Option<&'a str>,
 }
 
 #[derive(Serialize, Default)]
@@ -593,6 +736,14 @@ struct AddressDetails<'a> {
     road: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     city: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    city_district: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suburb: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neighbourhood: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarter: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -630,8 +781,57 @@ fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
     }
 }
 
+fn meters_to_rad_sq(meters: f64) -> f64 {
+    let meters_to_rad = meters / 111_320.0;
+    meters_to_rad * meters_to_rad
+}
+
+fn normalized_name(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn names_equal(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => normalized_name(a) == normalized_name(b),
+        _ => false,
+    }
+}
+
+fn clear_if_duplicate(value: &mut Option<&str>, others: &[Option<&str>]) {
+    if others.iter().copied().any(|other| names_equal(*value, other)) {
+        *value = None;
+    }
+}
+
+fn push_unique_part(parts: &mut Vec<String>, value: &str) {
+    if parts.iter().any(|part| normalized_name(part) == normalized_name(value)) {
+        return;
+    }
+    parts.push(value.to_string());
+}
+
+fn dedupe_address_details(addr: &mut AddressDetails<'_>) {
+    clear_if_duplicate(&mut addr.suburb, &[addr.city]);
+    clear_if_duplicate(&mut addr.neighbourhood, &[addr.city, addr.suburb]);
+    clear_if_duplicate(
+        &mut addr.quarter,
+        &[addr.city, addr.suburb, addr.neighbourhood],
+    );
+    clear_if_duplicate(
+        &mut addr.city_district,
+        &[addr.city, addr.suburb, addr.neighbourhood, addr.quarter],
+    );
+}
+
 fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
-    if addr.road.is_none() && addr.city.is_none() && addr.country.is_none() {
+    if addr.road.is_none()
+        && addr.suburb.is_none()
+        && addr.neighbourhood.is_none()
+        && addr.quarter.is_none()
+        && addr.city_district.is_none()
+        && addr.city.is_none()
+        && addr.country.is_none()
+    {
         return None;
     }
 
@@ -642,13 +842,23 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     if let Some(road) = addr.road {
         if let Some(ref hn) = addr.house_number {
             if number_after {
-                parts.push(format!("{} {}", road, hn));
+                push_unique_part(&mut parts, &format!("{} {}", road, hn));
             } else {
-                parts.push(format!("{} {}", hn, road));
+                push_unique_part(&mut parts, &format!("{} {}", hn, road));
             }
         } else {
-            parts.push(road.to_string());
+            push_unique_part(&mut parts, road);
         }
+    }
+
+    if let Some(suburb) = addr.suburb {
+        push_unique_part(&mut parts, suburb);
+    } else if let Some(neighbourhood) = addr.neighbourhood {
+        push_unique_part(&mut parts, neighbourhood);
+    } else if let Some(quarter) = addr.quarter {
+        push_unique_part(&mut parts, quarter);
+    } else if let Some(city_district) = addr.city_district {
+        push_unique_part(&mut parts, city_district);
     }
 
     // City + postcode + state
@@ -668,7 +878,7 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
             }
         }
         if !city_part.is_empty() {
-            parts.push(city_part.trim().to_string());
+            push_unique_part(&mut parts, city_part.trim());
         }
     } else {
         let mut city_part = String::new();
@@ -686,13 +896,13 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
             city_part.push_str(pc);
         }
         if !city_part.is_empty() {
-            parts.push(city_part);
+            push_unique_part(&mut parts, &city_part);
         }
     }
 
     // Country
     if let Some(country) = addr.country {
-        parts.push(country.to_string());
+        push_unique_part(&mut parts, country);
     }
 
     if parts.is_empty() { None } else { Some(parts.join(", ")) }
