@@ -509,6 +509,71 @@ impl Index {
         let display_name = format_address(&address);
         Address { display_name, address }
     }
+
+    fn snap(&self, lat: f64, lng: f64, search_distance: f64) -> Option<Snap> {
+        let meters_to_rad = search_distance / 111_320.0;
+        let max_dist = meters_to_rad * meters_to_rad;
+
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+
+        let all_ways: &[WayHeader] = unsafe {
+            std::slice::from_raw_parts(
+                self.street_ways.as_ptr() as *const WayHeader,
+                self.street_ways.len() / std::mem::size_of::<WayHeader>(),
+            )
+        };
+        let all_street_nodes: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.street_nodes.as_ptr() as *const NodeCoord,
+                self.street_nodes.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+
+        let cos_lat = lat.to_radians().cos();
+
+        let mut best_dist = f64::MAX;
+        let mut best_lat = 0.0_f64;
+        let mut best_lng = 0.0_f64;
+
+        let mut seen_streets: [u32; 64] = [u32::MAX; 64];
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            let offsets = Self::lookup_geo_cell(&self.geo_cells, c);
+
+            Self::for_each_entry(&self.street_entries, offsets.street, |id| {
+                let slot = (id as usize) & 0x3F;
+                if seen_streets[slot] == id { return; }
+                seen_streets[slot] = id;
+
+                let way = &all_ways[id as usize];
+                let offset = way.node_offset as usize;
+                let count = way.node_count as usize;
+                let nodes = &all_street_nodes[offset..offset + count];
+
+                for i in 0..nodes.len() - 1 {
+                    let ax = nodes[i].lat as f64;
+                    let ay = nodes[i].lng as f64;
+                    let bx = nodes[i + 1].lat as f64;
+                    let by = nodes[i + 1].lng as f64;
+                    let (dist, t) = point_to_segment_with_t(lat, lng, ax, ay, bx, by, cos_lat);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_lat = ax + t * (bx - ax);
+                        best_lng = ay + t * (by - ay);
+                    }
+                }
+            });
+        }
+
+        if best_dist >= max_dist { return None; }
+
+        Some(Snap {
+            lat: best_lat,
+            lng: best_lng,
+            distance: best_dist.sqrt() * 111_320.0,
+        })
+    }
 }
 
 // --- Geometry helpers ---
@@ -609,6 +674,14 @@ struct Address<'a> {
     address: AddressDetails<'a>,
 }
 
+#[derive(Serialize)]
+struct Snap {
+    lat: f64,
+    #[serde(rename = "lon")]
+    lng: f64,
+    distance: f64,
+}
+
 // Address formatting patterns by country code
 // Returns (number_after_street, postcode_before_city, include_state)
 fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
@@ -703,6 +776,29 @@ struct QueryParams {
     distance: Option<f64>,
 }
 
+fn authorize(
+    key: &Option<String>,
+    db: &RwLock<auth::Db>,
+    limiter: &auth::RateLimiter,
+    addr: std::net::SocketAddr,
+) -> Result<(), Response> {
+    let key = key.as_deref()
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing API key").into_response())?;
+
+    let (login, rps, rpd, by_ip) = db.read().unwrap().validate_token(key)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
+
+    let rate_key = if by_ip { format!("{}:{}", login, addr.ip()) } else { login };
+
+    auth::check_rate(limiter, &rate_key, rps, rpd)
+        .map_err(|msg| (StatusCode::TOO_MANY_REQUESTS, msg).into_response())
+}
+
+fn json_response<T: Serialize>(value: &T) -> Response {
+    let json = serde_json::to_string(value).unwrap_or_default();
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
+}
+
 async fn reverse_geocode(
     Query(params): Query<QueryParams>,
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
@@ -710,30 +806,26 @@ async fn reverse_geocode(
     limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    let key = match params.key {
-        Some(k) => k,
-        None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
-    };
-
-    let (login, rps, rpd, by_ip) = match state.read().unwrap().validate_token(&key) {
-        Some(info) => info,
-        None => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
-    };
-
-    let rate_key = if by_ip {
-        format!("{}:{}", login, connect_info.0.ip())
-    } else {
-        login
-    };
-
-    if let Err(msg) = auth::check_rate(&limiter, &rate_key, rps, rpd) {
-        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
-    }
+    if let Err(r) = authorize(&params.key, &state, &limiter, connect_info.0) { return r; }
 
     let search_distance = params.distance.unwrap_or(DEFAULT_SEARCH_DISTANCE);
-    let address = index.query(params.lat, params.lon, search_distance);
-    let json = serde_json::to_string(&address).unwrap_or_default();
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
+    json_response(&index.query(params.lat, params.lon, search_distance))
+}
+
+async fn snap_to_road(
+    Query(params): Query<QueryParams>,
+    state: axum::extract::State<Arc<RwLock<auth::Db>>>,
+    index: axum::extract::Extension<Arc<Index>>,
+    limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
+    connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if let Err(r) = authorize(&params.key, &state, &limiter, connect_info.0) { return r; }
+
+    let search_distance = params.distance.unwrap_or(DEFAULT_SEARCH_DISTANCE);
+    match index.snap(params.lat, params.lon, search_distance) {
+        Some(s) => json_response(&s),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[tokio::main]
@@ -764,6 +856,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/reverse", get(reverse_geocode))
+        .route("/snap", get(snap_to_road))
         .merge(auth::router())
         .layer(axum::Extension(index))
         .layer(axum::Extension(limiter))
