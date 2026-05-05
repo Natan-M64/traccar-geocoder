@@ -96,7 +96,6 @@ struct Index {
     strings: Mmap,
     street_cell_level: u64,
     admin_cell_level: u64,
-    max_distance_sq: f64,
 }
 
 const NO_DATA: u32 = 0xFFFFFFFF;
@@ -113,9 +112,7 @@ fn mmap_file(path: &str) -> Result<Mmap, String> {
 }
 
 impl Index {
-    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
-        let meters_to_rad = search_distance / 111_320.0;
-        let max_distance_sq = meters_to_rad * meters_to_rad;
+    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64) -> Result<Self, String> {
         Ok(Index {
             geo_cells: mmap_file(&format!("{}/geo_cells.bin", dir))?,
             street_entries: mmap_file(&format!("{}/street_entries.bin", dir))?,
@@ -133,7 +130,6 @@ impl Index {
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
-            max_distance_sq,
         })
     }
 
@@ -459,8 +455,9 @@ impl Index {
 
     // --- Combined query ---
 
-    fn query(&self, lat: f64, lng: f64) -> Address<'_> {
-        let max_dist = self.max_distance_sq;
+    fn query(&self, lat: f64, lng: f64, search_distance: f64) -> Address<'_> {
+        let meters_to_rad = search_distance / 111_320.0;
+        let max_dist = meters_to_rad * meters_to_rad;
 
         let admin = self.find_admin(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
@@ -703,6 +700,7 @@ struct QueryParams {
     lat: f64,
     lon: f64,
     key: Option<String>,
+    distance: Option<f64>,
 }
 
 async fn reverse_geocode(
@@ -732,7 +730,8 @@ async fn reverse_geocode(
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
 
-    let address = index.query(params.lat, params.lon);
+    let search_distance = params.distance.unwrap_or(DEFAULT_SEARCH_DISTANCE);
+    let address = index.query(params.lat, params.lon, search_distance);
     let json = serde_json::to_string(&address).unwrap_or_default();
     ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
 }
@@ -747,13 +746,12 @@ async fn main() {
     };
     let street_cell_level = arg_value("--street-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_STREET_CELL_LEVEL);
     let admin_cell_level = arg_value("--admin-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_ADMIN_CELL_LEVEL);
-    let search_distance = arg_value("--search-distance").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SEARCH_DISTANCE);
 
     let db_path = format!("{}/geocoder.json", data_dir);
     let db = auth::Db::load(&db_path);
 
     eprintln!("Loading index from {}...", data_dir);
-    let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
+    let index = match Index::load(data_dir, street_cell_level, admin_cell_level) {
         Ok(idx) => Arc::new(idx),
         Err(e) => {
             eprintln!("Error: {}", e);

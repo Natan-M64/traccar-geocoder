@@ -72,6 +72,7 @@ Query parameters:
 - `lat` - latitude (required)
 - `lon` - longitude (required)
 - `key` - API key (required)
+- `distance` - max search distance in meters (optional, default 75)
 
 Example request:
 
