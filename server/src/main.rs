@@ -100,6 +100,7 @@ struct PlaceNode {
     lng: f32,
     name_id: u32,
     semantic: u8,
+    country_code: u16, // packed ISO 3166-1 alpha-2, 0 = unknown
 }
 
 // --- Index data ---
@@ -455,10 +456,14 @@ impl Index {
             });
         }
 
-        // Fallback: nearest place node by semantic (only when country resolved,
-        // to avoid suggesting places from a different country).
+        // Fallback: nearest place node by semantic. Only consider nodes whose
+        // country matches the resolved country, to avoid cross-border leaks
+        // (e.g. a Luxembourg suburb showing up for a French point near the border).
         let mut best_node_by_semantic: [Option<(f32, &PlaceNode)>; SEM_COUNT] = [None; SEM_COUNT];
-        if best_by_semantic[SEM_COUNTRY as usize].is_some() {
+        let resolved_country = best_by_semantic[SEM_COUNTRY as usize].and_then(|(_, p)| {
+            if p.country_code != 0 { Some(p.country_code) } else { None }
+        });
+        if let Some(country) = resolved_country {
             let all_places: &[PlaceNode] = unsafe {
                 std::slice::from_raw_parts(
                     self.place_nodes.as_ptr() as *const PlaceNode,
@@ -473,6 +478,7 @@ impl Index {
                     let semantic = node.semantic as usize;
                     if semantic == SEM_NONE as usize || semantic >= SEM_COUNT { return; }
                     if best_by_semantic[semantic].is_some() { return; }
+                    if node.country_code != 0 && node.country_code != country { return; }
                     let dx = node.lat - qlat;
                     let dy = node.lng - qlng;
                     let dist = dx * dx + dy * dy;

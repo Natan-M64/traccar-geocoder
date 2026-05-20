@@ -2,158 +2,14 @@
 
 #include <cstdint>
 #include <cstring>
-#include <string>
-#include <unordered_map>
-#include <vector>
 
-// Address level rank lookup, based on Nominatim's settings/address-levels.json.
-// https://github.com/osm-search/Nominatim/blob/master/settings/address-levels.json
-//
-// Ranks are mapped to semantic levels (country/state/county/city/suburb/postcode)
-// in the get_semantic() helper. Tag values for boundary=administrative use the form
-// "administrative<N>" where N is the admin_level.
+// Direct per-country mapping of OSM admin_level / place tag to one of our
+// fixed output fields. Derived from Nominatim's settings/address-levels.json
+// but flattened: we only care about country/state/county/city/suburb/postcode,
+// so anything Nominatim treats as an intermediate level is just ignored here.
 
 namespace address_levels {
 
-// Each rule lists (tag_key, tag_value) -> (polygon_rank, node_rank).
-// A rank of -1 means the tag doesn't produce an address entry in that form.
-struct Rule {
-    const char* key;
-    const char* value;
-    int8_t polygon_rank;
-    int8_t node_rank;
-};
-
-// Default rules (used when no country override matches).
-static const Rule kDefaultRules[] = {
-    // boundary=administrative
-    {"boundary", "administrative2",  4,  4},
-    {"boundary", "administrative3",  6,  6},
-    {"boundary", "administrative4",  8,  8},
-    {"boundary", "administrative5", 10, 10},
-    {"boundary", "administrative6", 12, 12},
-    {"boundary", "administrative7", 14, 14},
-    {"boundary", "administrative8", 16, 16},
-    {"boundary", "administrative9", 18, 18},
-    {"boundary", "administrative10", 20, 20},
-    {"boundary", "administrative11", 22, 22},
-    {"boundary", "administrative12", 24, 24},
-    // place=* (polygon rank, node rank)
-    {"place", "country",       4,  4},
-    {"place", "state",         8,  8},
-    {"place", "province",      8,  8},
-    {"place", "county",       12, 12},
-    {"place", "city",         16, 16},
-    {"place", "town",         18, 16},
-    {"place", "village",      19, 16},
-    {"place", "borough",      18, 18},
-    {"place", "suburb",       19, 20},
-    {"place", "hamlet",       20, 20},
-    {"place", "neighbourhood", 24, 24},
-    {"place", "quarter",      20, 22},
-    {"place", "locality",     25, 25},
-};
-
-// Country-specific overrides (sparse - only deltas from defaults).
-struct CountryOverride {
-    const char* country_code; // lowercase ISO 3166-1 alpha-2
-    const Rule* rules;
-    size_t rule_count;
-};
-
-static const Rule kAuRules[]  = {{"boundary", "administrative6", 12, 0}};
-static const Rule kCaRules[]  = {{"place", "county", 12, 0}};
-static const Rule kCzRules[]  = {
-    {"boundary", "administrative5",  12, 12},
-    {"boundary", "administrative6",  13, 0},
-    {"boundary", "administrative7",  14, 0},
-    {"boundary", "administrative8",  14, 14},
-    {"boundary", "administrative9",  15, 15},
-    {"boundary", "administrative10", 16, 16},
-};
-static const Rule kDeRules[]  = {
-    {"place", "region",  10, 0},
-    {"place", "county",  12, 0},
-    {"boundary", "administrative5", 10, 0},
-};
-static const Rule kBeRules[]  = {
-    {"boundary", "administrative3",   5,  0},
-    {"boundary", "administrative4",   6,  6},
-    {"boundary", "administrative5",   7,  0},
-    {"boundary", "administrative6",   8,  8},
-    {"boundary", "administrative7",  12, 12},
-    {"boundary", "administrative8",  14, 14},
-    {"boundary", "administrative9",  16, 16},
-    {"boundary", "administrative10", 18, 18},
-};
-static const Rule kBrRules[]  = {
-    {"boundary", "administrative5", 10, 0},
-    {"boundary", "administrative6", 12, 0},
-    {"boundary", "administrative7", 14, 0},
-};
-static const Rule kNordicRules[] = {
-    {"boundary", "administrative3",  8,  8},
-    {"boundary", "administrative4", 12, 12},
-};
-static const Rule kIdRules[]  = {
-    {"place", "municipality", 18, 18},
-    {"boundary", "administrative5",  12, 12},
-    {"boundary", "administrative6",  14, 14},
-    {"boundary", "administrative7",  16, 16},
-    {"boundary", "administrative8",  20, 20},
-    {"boundary", "administrative9",  22, 22},
-    {"boundary", "administrative10", 24, 24},
-};
-static const Rule kRuRules[]  = {
-    {"place", "municipality", 18, 18},
-    {"boundary", "administrative5", 10, 0},
-    {"boundary", "administrative7", 13, 0},
-    {"boundary", "administrative8", 14, 14},
-};
-static const Rule kNlRules[]  = {
-    {"boundary", "administrative7",  13, 0},
-    {"boundary", "administrative8",  14, 14},
-    {"boundary", "administrative9",  15, 0},
-    {"boundary", "administrative10", 16, 16},
-};
-static const Rule kEsRules[]  = {
-    {"place", "province",     10, 10},
-    {"place", "civil_parish", 18, 18},
-    {"boundary", "administrative5",  10, 0},
-    {"boundary", "administrative6",  10, 10},
-    {"boundary", "administrative7",  12, 12},
-    {"boundary", "administrative10", 22, 22},
-};
-static const Rule kSaRules[]  = {
-    {"place", "province",     12, 12},
-    {"place", "municipality", 18, 18},
-};
-static const Rule kJpRules[]  = {
-    {"boundary", "administrative7",  16, 16},
-    {"boundary", "administrative8",  18, 18},
-    {"boundary", "administrative9",  20, 20},
-    {"boundary", "administrative10", 22, 22},
-    {"boundary", "administrative11", 24, 24},
-};
-
-static const CountryOverride kCountryOverrides[] = {
-    {"au", kAuRules,    sizeof(kAuRules)/sizeof(Rule)},
-    {"ca", kCaRules,    sizeof(kCaRules)/sizeof(Rule)},
-    {"cz", kCzRules,    sizeof(kCzRules)/sizeof(Rule)},
-    {"de", kDeRules,    sizeof(kDeRules)/sizeof(Rule)},
-    {"be", kBeRules,    sizeof(kBeRules)/sizeof(Rule)},
-    {"br", kBrRules,    sizeof(kBrRules)/sizeof(Rule)},
-    {"se", kNordicRules, sizeof(kNordicRules)/sizeof(Rule)},
-    {"no", kNordicRules, sizeof(kNordicRules)/sizeof(Rule)},
-    {"id", kIdRules,    sizeof(kIdRules)/sizeof(Rule)},
-    {"ru", kRuRules,    sizeof(kRuRules)/sizeof(Rule)},
-    {"nl", kNlRules,    sizeof(kNlRules)/sizeof(Rule)},
-    {"es", kEsRules,    sizeof(kEsRules)/sizeof(Rule)},
-    {"sa", kSaRules,    sizeof(kSaRules)/sizeof(Rule)},
-    {"jp", kJpRules,    sizeof(kJpRules)/sizeof(Rule)},
-};
-
-// Semantic level enum stored in the index.
 enum class Semantic : uint8_t {
     None     = 0,
     Country  = 1,
@@ -164,43 +20,182 @@ enum class Semantic : uint8_t {
     Postcode = 6,
 };
 
-// Look up rank for (country, tag_key, tag_value). is_polygon picks polygon vs node rank.
-// Returns -1 if no rule matches (caller should skip this entry).
-inline int8_t lookup_rank(const char* country_code, const char* key,
-                          const char* value, bool is_polygon) {
-    auto find_in = [&](const Rule* rules, size_t n) -> int8_t {
-        for (size_t i = 0; i < n; i++) {
-            if (std::strcmp(rules[i].key, key) == 0 &&
-                std::strcmp(rules[i].value, value) == 0) {
-                int8_t r = is_polygon ? rules[i].polygon_rank : rules[i].node_rank;
-                return r;
-            }
-        }
-        return -1;
-    };
+struct LevelEntry {
+    uint8_t admin_level;
+    Semantic semantic;
+};
+
+struct PlaceEntry {
+    const char* place_value;
+    Semantic polygon_semantic; // when boundary=place + place=X
+    Semantic node_semantic;    // when place=X is on a node
+};
+
+struct CountryRules {
+    const char* country_code;  // lowercase ISO 3166-1 alpha-2, "" for default
+    const LevelEntry* admin;
+    size_t admin_count;
+};
+
+// --- Default admin_level mapping (used when no country override matches) ---
+static const LevelEntry kDefaultAdmin[] = {
+    {2,  Semantic::Country},
+    {4,  Semantic::State},
+    {6,  Semantic::County},
+    {8,  Semantic::City},
+    {9,  Semantic::Suburb},
+    {10, Semantic::Suburb},
+};
+
+// --- Country overrides ---
+// Most countries use the default. Only list deltas when OSM tags admin_level
+// differently. Each table is the complete mapping for that country (not
+// merged with defaults).
+
+static const LevelEntry kAuAdmin[] = {
+    {2, Semantic::Country},
+    {4, Semantic::State},
+    {6, Semantic::County},   // Local Government Area
+    {9, Semantic::Suburb},   // suburb (Lyndhurst etc.)
+};
+
+static const LevelEntry kBrAdmin[] = {
+    {2, Semantic::Country},
+    {4, Semantic::State},
+    // 3 = macroregion, 5 = mesoregion, 7 = immediate region: ignored
+    {6, Semantic::County},
+    {8, Semantic::City},     // município
+};
+
+static const LevelEntry kCzAdmin[] = {
+    {2,  Semantic::Country},
+    {4,  Semantic::State},   // kraj
+    {7,  Semantic::County},  // okres
+    {10, Semantic::City},    // city
+};
+
+static const LevelEntry kDeAdmin[] = {
+    {2,  Semantic::Country},
+    {4,  Semantic::State},
+    {6,  Semantic::County},  // Regierungsbezirk
+    {8,  Semantic::City},
+    {10, Semantic::Suburb},
+};
+
+static const LevelEntry kBeAdmin[] = {
+    {2, Semantic::Country},
+    {4, Semantic::State},    // region
+    {6, Semantic::County},   // province
+    {8, Semantic::City},
+};
+
+static const LevelEntry kNlAdmin[] = {
+    {2,  Semantic::Country},
+    {4,  Semantic::State},   // province
+    {8,  Semantic::City},
+    {10, Semantic::Suburb},
+};
+
+static const LevelEntry kEsAdmin[] = {
+    {2, Semantic::Country},
+    {4, Semantic::State},    // autonomous community
+    {6, Semantic::County},   // province
+    {8, Semantic::City},     // municipality
+};
+
+static const LevelEntry kIdAdmin[] = {
+    {2, Semantic::Country},
+    {4, Semantic::State},    // province
+    {5, Semantic::County},   // kabupaten / kota
+    {6, Semantic::City},
+    {7, Semantic::Suburb},
+};
+
+static const LevelEntry kRuAdmin[] = {
+    {2, Semantic::Country},
+    {4, Semantic::State},    // federal subject
+    {6, Semantic::County},
+    {8, Semantic::City},
+};
+
+static const LevelEntry kJpAdmin[] = {
+    {2,  Semantic::Country},
+    {4,  Semantic::State},   // prefecture
+    {7,  Semantic::County},
+    {8,  Semantic::City},
+};
+
+static const LevelEntry kNordicAdmin[] = {  // Sweden, Norway
+    {2, Semantic::Country},
+    {3, Semantic::State},    // county/fylke
+    {4, Semantic::City},     // municipality
+};
+
+static const LevelEntry kSaAdmin[] = {
+    {2, Semantic::Country},
+    {4, Semantic::State},    // province
+};
+
+static const CountryRules kCountryRules[] = {
+    {"au", kAuAdmin,     sizeof(kAuAdmin)/sizeof(LevelEntry)},
+    {"br", kBrAdmin,     sizeof(kBrAdmin)/sizeof(LevelEntry)},
+    {"cz", kCzAdmin,     sizeof(kCzAdmin)/sizeof(LevelEntry)},
+    {"de", kDeAdmin,     sizeof(kDeAdmin)/sizeof(LevelEntry)},
+    {"be", kBeAdmin,     sizeof(kBeAdmin)/sizeof(LevelEntry)},
+    {"nl", kNlAdmin,     sizeof(kNlAdmin)/sizeof(LevelEntry)},
+    {"es", kEsAdmin,     sizeof(kEsAdmin)/sizeof(LevelEntry)},
+    {"id", kIdAdmin,     sizeof(kIdAdmin)/sizeof(LevelEntry)},
+    {"ru", kRuAdmin,     sizeof(kRuAdmin)/sizeof(LevelEntry)},
+    {"jp", kJpAdmin,     sizeof(kJpAdmin)/sizeof(LevelEntry)},
+    {"se", kNordicAdmin, sizeof(kNordicAdmin)/sizeof(LevelEntry)},
+    {"no", kNordicAdmin, sizeof(kNordicAdmin)/sizeof(LevelEntry)},
+    {"sa", kSaAdmin,     sizeof(kSaAdmin)/sizeof(LevelEntry)},
+};
+
+// --- Place tag mapping (country-independent) ---
+// Used for both boundary=place + place=X polygons and standalone place=X nodes.
+static const PlaceEntry kPlaces[] = {
+    {"city",          Semantic::City,    Semantic::City},
+    {"town",          Semantic::City,    Semantic::City},
+    {"village",       Semantic::City,    Semantic::City},
+    {"borough",       Semantic::Suburb,  Semantic::Suburb},
+    {"suburb",        Semantic::Suburb,  Semantic::Suburb},
+    {"hamlet",        Semantic::None,    Semantic::City},   // hamlet only useful as node fallback
+    {"quarter",       Semantic::Suburb,  Semantic::Suburb},
+    {"neighbourhood", Semantic::None,    Semantic::None},   // too granular
+};
+
+// --- Lookup helpers ---
+
+inline Semantic lookup_admin(const char* country_code, uint8_t admin_level) {
+    const LevelEntry* table = kDefaultAdmin;
+    size_t count = sizeof(kDefaultAdmin) / sizeof(LevelEntry);
 
     if (country_code && country_code[0]) {
         char lower[3] = {static_cast<char>(std::tolower(country_code[0])),
                          static_cast<char>(std::tolower(country_code[1])), 0};
-        for (const auto& ov : kCountryOverrides) {
-            if (std::strcmp(ov.country_code, lower) == 0) {
-                int8_t r = find_in(ov.rules, ov.rule_count);
-                if (r >= 0) return r;
+        for (const auto& rules : kCountryRules) {
+            if (std::strcmp(rules.country_code, lower) == 0) {
+                table = rules.admin;
+                count = rules.admin_count;
                 break;
             }
         }
     }
-    return find_in(kDefaultRules, sizeof(kDefaultRules)/sizeof(Rule));
+
+    for (size_t i = 0; i < count; i++) {
+        if (table[i].admin_level == admin_level) return table[i].semantic;
+    }
+    return Semantic::None;
 }
 
-// Map a Nominatim rank to our semantic level. Returns Semantic::None for
-// ranks outside our address chain (highway, building, etc.).
-inline Semantic rank_to_semantic(int8_t rank) {
-    if (rank >= 4  && rank <= 7)  return Semantic::Country;
-    if (rank >= 8  && rank <= 11) return Semantic::State;
-    if (rank >= 12 && rank <= 15) return Semantic::County;
-    if (rank >= 16 && rank <= 17) return Semantic::City;
-    if (rank >= 18 && rank <= 21) return Semantic::Suburb;
+inline Semantic lookup_place(const char* value, bool is_polygon) {
+    if (!value) return Semantic::None;
+    for (const auto& p : kPlaces) {
+        if (std::strcmp(p.place_value, value) == 0) {
+            return is_polygon ? p.polygon_semantic : p.node_semantic;
+        }
+    }
     return Semantic::None;
 }
 

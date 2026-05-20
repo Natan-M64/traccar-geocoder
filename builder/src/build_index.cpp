@@ -69,9 +69,11 @@ struct AdminPolygon {
 
 // Tag info kept in parallel during build, used to compute semantic level
 // after pass 2 once we know each polygon's parent country.
+// kind=0 means admin_level (numeric stored as level), kind=1 means place=X (value).
 struct PolyTagInfo {
-    std::string key;    // "boundary" or "place"
-    std::string value;  // e.g. "administrative8" or "city"
+    uint8_t kind;       // 0 = admin, 1 = place
+    uint8_t level;      // when kind==0
+    std::string value;  // when kind==1
 };
 
 struct NodeCoord {
@@ -83,7 +85,8 @@ struct PlaceNode {
     float lat;
     float lng;
     uint32_t name_id;
-    uint8_t semantic;   // address_levels::Semantic
+    uint8_t semantic;     // address_levels::Semantic
+    uint16_t country_code; // packed ISO 3166-1 alpha-2, 0 = unknown
 };
 
 // Tag info for place nodes (build-time only, parallel to place_nodes)
@@ -423,13 +426,13 @@ static void add_addr_point(double lat, double lng,
 // --- Add an admin polygon ---
 //
 // `semantic` may be Semantic::None to defer; the post-pass will compute it
-// from `tag_key`/`tag_value` once the parent country is known. Pass a fixed
-// value (e.g. Country for ISO-tagged level 2, Postcode for boundary=postal_code)
+// from `tag` once the parent country is known. Pass a fixed value
+// (e.g. Country for ISO-tagged level 2, Postcode for boundary=postal_code)
 // to skip the lookup.
 static void add_admin_polygon(const std::vector<std::pair<double,double>>& vertices,
                                const char* name,
                                address_levels::Semantic semantic,
-                               const char* tag_key, const char* tag_value,
+                               const PolyTagInfo& tag,
                                const char* country_code) {
     // Simplify large polygons (proportional to preserve border accuracy)
     size_t max_vertices = std::clamp(vertices.size() / 5, size_t(500), size_t(65000));
@@ -453,7 +456,7 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
         ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
         : 0;
     admin_polygons.push_back(poly);
-    poly_tag_info.push_back({tag_key ? tag_key : "", tag_value ? tag_value : ""});
+    poly_tag_info.push_back(tag);
 
     // S2 cell coverage (high bit marks interior cells)
     auto cell_ids = cover_polygon(simplified);
@@ -538,8 +541,8 @@ public:
 
         const char* name = area.tags()["name"];
 
-        // Decide tag key/value and an immediate semantic where possible.
-        std::string tag_key, tag_value;
+        // Decide tag info + immediate semantic where possible.
+        PolyTagInfo tag{};
         address_levels::Semantic semantic = address_levels::Semantic::None;
         const char* country_code = nullptr;
         std::string name_str;
@@ -550,8 +553,8 @@ public:
             int admin_level = std::atoi(level_str);
             if (admin_level < 2 || admin_level > 12) return;
 
-            tag_key = "boundary";
-            tag_value = "administrative" + std::to_string(admin_level);
+            tag.kind = 0;
+            tag.level = static_cast<uint8_t>(admin_level);
             name_str = name;
 
             if (admin_level == 2) {
@@ -562,15 +565,14 @@ public:
         } else if (is_place) {
             const char* place = area.tags()["place"];
             if (!place || !name) return;
-            tag_key = "place";
-            tag_value = place;
+            tag.kind = 1;
+            tag.value = place;
             name_str = name;
         } else { // is_postal
             const char* postal_code = area.tags()["postal_code"];
             if (!postal_code) postal_code = name;
             if (!postal_code) return;
-            tag_key = "boundary";
-            tag_value = "postal_code";
+            // No tag info needed - semantic is already final
             name_str = postal_code;
             semantic = address_levels::Semantic::Postcode;
         }
@@ -588,12 +590,11 @@ public:
             }
             if (vertices.size() < 3) continue;
 
-            add_admin_polygon(vertices, name_str.c_str(), semantic,
-                              tag_key.c_str(), tag_value.c_str(), country_code);
+            add_admin_polygon(vertices, name_str.c_str(), semantic, tag, country_code);
             if (extra_postal_code) {
+                PolyTagInfo none{};
                 add_admin_polygon(vertices, extra_postal_code,
-                                  address_levels::Semantic::Postcode,
-                                  "boundary", "postal_code", nullptr);
+                                  address_levels::Semantic::Postcode, none, nullptr);
             }
         }
 
@@ -935,23 +936,28 @@ static void resolve_semantic_levels() {
         cy /= p.vertex_count;
 
         const char* country_code = find_country(cx, cy);
-        int8_t rank = address_levels::lookup_rank(country_code,
-                                                  poly_tag_info[i].key.c_str(),
-                                                  poly_tag_info[i].value.c_str(),
-                                                  true);
-        p.semantic = static_cast<uint8_t>(address_levels::rank_to_semantic(rank));
-        if (p.semantic != (uint8_t)address_levels::Semantic::None) resolved_polys++;
+        address_levels::Semantic sem = address_levels::Semantic::None;
+        const auto& tag = poly_tag_info[i];
+        if (tag.kind == 0) {
+            sem = address_levels::lookup_admin(country_code, tag.level);
+        } else {
+            sem = address_levels::lookup_place(tag.value.c_str(), true /* polygon */);
+        }
+        p.semantic = static_cast<uint8_t>(sem);
+        if (sem != address_levels::Semantic::None) resolved_polys++;
     }
 
     uint32_t resolved_places = 0;
     for (uint32_t i = 0; i < place_nodes.size(); i++) {
         auto& n = place_nodes[i];
         const char* country_code = find_country(n.lat, n.lng);
-        int8_t rank = address_levels::lookup_rank(country_code, "place",
-                                                  place_node_tag_info[i].place_type.c_str(),
-                                                  false /* node */);
-        n.semantic = static_cast<uint8_t>(address_levels::rank_to_semantic(rank));
-        if (n.semantic != (uint8_t)address_levels::Semantic::None) resolved_places++;
+        address_levels::Semantic sem = address_levels::lookup_place(
+            place_node_tag_info[i].place_type.c_str(), false /* node */);
+        n.semantic = static_cast<uint8_t>(sem);
+        n.country_code = (country_code && country_code[0] && country_code[1])
+            ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
+            : 0;
+        if (sem != address_levels::Semantic::None) resolved_places++;
     }
 
     std::cerr << "Resolved semantic level for " << resolved_polys << "/"
