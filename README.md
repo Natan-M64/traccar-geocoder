@@ -197,13 +197,13 @@ cargo build --release --manifest-path server/Cargo.toml
 
 ```bash
 # Create index from PBF file
-./build/build-index output-dir input.osm.pbf [input2.osm.pbf ...]
+./build/build-index data-dir/index input.osm.pbf [input2.osm.pbf ...]
 
 # Start the server
-./server/target/release/query-server output-dir [bind-address]
+./server/target/release/query-server data-dir [bind-address]
 
 # Start with automatic HTTPS
-./server/target/release/query-server output-dir --domain geocoder.example.com
+./server/target/release/query-server data-dir --domain geocoder.example.com
 ```
 
 ## Environment Variables (Docker)

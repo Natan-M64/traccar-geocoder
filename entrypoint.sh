@@ -39,7 +39,11 @@ build_index() {
 }
 
 serve() {
-    args="$DATA_DIR/index"
+    if [ ! -f "$DATA_DIR/geocoder.json" ] && [ -f "$DATA_DIR/index/geocoder.json" ]; then
+        echo "Migrating geocoder.json out of index folder..."
+        mv "$DATA_DIR/index/geocoder.json" "$DATA_DIR/geocoder.json"
+    fi
+    args="$DATA_DIR"
     if [ -n "$DOMAIN" ]; then
         args="$args --domain $DOMAIN"
         if [ -n "$CACHE_DIR" ]; then

@@ -934,8 +934,9 @@ async fn main() {
     let db_path = format!("{}/geocoder.json", data_dir);
     let db = auth::Db::load(&db_path);
 
-    eprintln!("Loading index from {}...", data_dir);
-    let index = match Index::load(data_dir, street_cell_level, admin_cell_level) {
+    let index_dir = format!("{}/index", data_dir);
+    eprintln!("Loading index from {}...", index_dir);
+    let index = match Index::load(&index_dir, street_cell_level, admin_cell_level) {
         Ok(idx) => Arc::new(idx),
         Err(e) => {
             eprintln!("Error: {}", e);
