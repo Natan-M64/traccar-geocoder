@@ -1,6 +1,6 @@
 services:
   geocoder:
-    image: ghcr.io/natan-m64/traccar-geocoder:admin-resolution-split
+    image: ghcr.io/natan-m64/traccar-geocoder:latest
     pull_policy: always
     environment:
       - PBF_URLS=https://download.geofabrik.de/south-america/brazil/nordeste-latest.osm.pbf
