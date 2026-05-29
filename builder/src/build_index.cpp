@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -28,6 +29,8 @@
 #include <s2/s2loop.h>
 #include <s2/s2builder.h>
 
+#include "address_levels.hpp"
+
 // --- Binary format structs ---
 
 struct WayHeader {
@@ -41,6 +44,9 @@ struct AddrPoint {
     float lng;
     uint32_t housenumber_id;
     uint32_t street_id;
+    uint32_t city_id;     // addr:city, 0 = none
+    uint32_t suburb_id;   // addr:suburb, 0 = none
+    uint32_t postcode_id; // addr:postcode, 0 = none
 };
 
 struct InterpWay {
@@ -56,16 +62,18 @@ struct AdminPolygon {
     uint32_t vertex_offset;
     uint16_t vertex_count;
     uint32_t name_id;
-    uint8_t admin_level;
+    uint8_t semantic;   // address_levels::Semantic enum
     float area;
     uint16_t country_code;
 };
 
-struct PlacePoint {
-    float lat;
-    float lng;
-    uint32_t name_id;
-    uint8_t place_type;
+// Tag info kept in parallel during build, used to compute semantic level
+// after pass 2 once we know each polygon's parent country.
+// kind=0 means admin_level (numeric stored as level), kind=1 means place=X (value).
+struct PolyTagInfo {
+    uint8_t kind;       // 0 = admin, 1 = place
+    uint8_t level;      // when kind==0
+    std::string value;  // when kind==1
 };
 
 struct NodeCoord {
@@ -73,15 +81,21 @@ struct NodeCoord {
     float lng;
 };
 
+struct PlaceNode {
+    float lat;
+    float lng;
+    uint32_t name_id;
+    uint8_t semantic;     // address_levels::Semantic
+    uint16_t country_code; // packed ISO 3166-1 alpha-2, 0 = unknown
+};
+
+// Tag info for place nodes (build-time only, parallel to place_nodes)
+struct PlaceNodeTagInfo {
+    std::string place_type; // e.g. "city", "town", "village"
+};
+
 static const uint32_t INTERIOR_FLAG = 0x80000000u;
 static const uint32_t ID_MASK = 0x7FFFFFFFu;
-
-enum PlaceType : uint8_t {
-    PLACE_SUBURB = 1,
-    PLACE_NEIGHBOURHOOD = 2,
-    PLACE_QUARTER = 3,
-    PLACE_CITY_DISTRICT = 4,
-};
 
 // --- String interning ---
 
@@ -126,11 +140,13 @@ static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
 
 // Admin boundaries
 static std::vector<AdminPolygon> admin_polygons;
+static std::vector<PolyTagInfo> poly_tag_info; // parallel to admin_polygons (build-time only)
 static std::vector<NodeCoord> admin_vertices;
 static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
-// Place points
-static std::vector<PlacePoint> place_points;
+// Place nodes (city/town/village/suburb points)
+static std::vector<PlaceNode> place_nodes;
+static std::vector<PlaceNodeTagInfo> place_node_tag_info; // parallel to place_nodes (build-time only)
 static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_places;
 
 // --- S2 helpers ---
@@ -159,10 +175,6 @@ static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, d
 
 static S2CellId point_to_cell(double lat, double lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel);
-}
-
-static S2CellId point_to_admin_cell(double lat, double lng) {
-    return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
 }
 
 // Returns pairs of (cell_id, is_interior)
@@ -379,26 +391,27 @@ static uint32_t parse_house_number(const char* s) {
     return n;
 }
 
-static uint8_t parse_place_type(const char* place) {
-    if (!place) return 0;
-    if (std::strcmp(place, "suburb") == 0) return PLACE_SUBURB;
-    if (std::strcmp(place, "neighbourhood") == 0) return PLACE_NEIGHBOURHOOD;
-    if (std::strcmp(place, "quarter") == 0) return PLACE_QUARTER;
-    if (std::strcmp(place, "city_district") == 0) return PLACE_CITY_DISTRICT;
-    return 0;
-}
-
 // --- Add an address point ---
 
 static uint64_t addr_count_total = 0;
 
-static void add_addr_point(double lat, double lng, const char* housenumber, const char* street) {
+// String ID 0 is reserved for "not present" (interned as empty string in main).
+static inline uint32_t intern_or_zero(const char* s) {
+    return (s && *s) ? strings.intern(s) : 0;
+}
+
+static void add_addr_point(double lat, double lng,
+                            const char* housenumber, const char* street,
+                            const char* city, const char* suburb, const char* postcode) {
     uint32_t addr_id = static_cast<uint32_t>(addr_points.size());
     addr_points.push_back({
         static_cast<float>(lat),
         static_cast<float>(lng),
         strings.intern(housenumber),
-        strings.intern(street)
+        strings.intern(street),
+        intern_or_zero(city),
+        intern_or_zero(suburb),
+        intern_or_zero(postcode),
     });
 
     S2CellId cell = point_to_cell(lat, lng);
@@ -410,23 +423,16 @@ static void add_addr_point(double lat, double lng, const char* housenumber, cons
     }
 }
 
-static void add_place_point(double lat, double lng, const char* name, uint8_t place_type) {
-    uint32_t place_id = static_cast<uint32_t>(place_points.size());
-    place_points.push_back({
-        static_cast<float>(lat),
-        static_cast<float>(lng),
-        strings.intern(name),
-        place_type
-    });
-
-    S2CellId cell = point_to_admin_cell(lat, lng);
-    cell_to_places[cell.id()].push_back(place_id);
-}
-
 // --- Add an admin polygon ---
-
+//
+// `semantic` may be Semantic::None to defer; the post-pass will compute it
+// from `tag` once the parent country is known. Pass a fixed value
+// (e.g. Country for ISO-tagged level 2, Postcode for boundary=postal_code)
+// to skip the lookup.
 static void add_admin_polygon(const std::vector<std::pair<double,double>>& vertices,
-                               const char* name, uint8_t admin_level,
+                               const char* name,
+                               address_levels::Semantic semantic,
+                               const PolyTagInfo& tag,
                                const char* country_code) {
     // Simplify large polygons (proportional to preserve border accuracy)
     size_t max_vertices = std::clamp(vertices.size() / 5, size_t(500), size_t(65000));
@@ -444,12 +450,13 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
     poly.vertex_offset = vertex_offset;
     poly.vertex_count = static_cast<uint16_t>(std::min(simplified.size(), size_t(65535)));
     poly.name_id = strings.intern(name);
-    poly.admin_level = admin_level;
+    poly.semantic = static_cast<uint8_t>(semantic);
     poly.area = polygon_area(simplified);
     poly.country_code = (country_code && country_code[0] && country_code[1])
         ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
         : 0;
     admin_polygons.push_back(poly);
+    poly_tag_info.push_back(tag);
 
     // S2 cell coverage (high bit marks interior cells)
     auto cell_ids = cover_polygon(simplified);
@@ -465,19 +472,32 @@ class BuildHandler : public osmium::handler::Handler {
 public:
     void node(const osmium::Node& node) {
         if (!node.location().valid()) return;
+        double lat = node.location().lat();
+        double lng = node.location().lon();
 
-        const char* name = node.tags()["name"];
-        uint8_t place_type = parse_place_type(node.tags()["place"]);
-        if (name && place_type != 0) {
-            process_place(node, name, place_type);
+        // Address point
+        const char* housenumber = node.tags()["addr:housenumber"];
+        const char* street = node.tags()["addr:street"];
+        if (housenumber && street) {
+            add_addr_point(lat, lng, housenumber, street,
+                           node.tags()["addr:city"],
+                           node.tags()["addr:suburb"],
+                           node.tags()["addr:postcode"]);
         }
 
-        const char* housenumber = node.tags()["addr:housenumber"];
-        if (!housenumber) return;
-        const char* street = node.tags()["addr:street"];
-        if (!street) return;
-
-        add_addr_point(node.location().lat(), node.location().lon(), housenumber, street);
+        // Place node (city/town/village/suburb/hamlet/...)
+        const char* place = node.tags()["place"];
+        const char* name = node.tags()["name"];
+        if (place && name) {
+            uint32_t place_id = static_cast<uint32_t>(place_nodes.size());
+            place_nodes.push_back({
+                static_cast<float>(lat), static_cast<float>(lng),
+                strings.intern(name), 0 /* semantic filled in post-pass */
+            });
+            place_node_tag_info.push_back({place});
+            S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
+            cell_to_places[cell.id()].push_back(place_id);
+        }
     }
 
     void way(const osmium::Way& way) {
@@ -493,7 +513,10 @@ public:
         if (housenumber) {
             const char* street = way.tags()["addr:street"];
             if (street) {
-                process_building_address(way, housenumber, street);
+                process_building_address(way, housenumber, street,
+                                         way.tags()["addr:city"],
+                                         way.tags()["addr:suburb"],
+                                         way.tags()["addr:postcode"]);
             }
         }
 
@@ -511,41 +534,53 @@ public:
         const char* boundary = area.tags()["boundary"];
         if (!boundary) return;
 
-        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
+        bool is_admin  = (std::strcmp(boundary, "administrative") == 0);
+        bool is_place  = (std::strcmp(boundary, "place") == 0);
         bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
-        if (!is_admin && !is_postal) return;
-
-        uint8_t admin_level = 0;
-        if (is_admin) {
-            const char* level_str = area.tags()["admin_level"];
-            if (!level_str) return;
-            admin_level = static_cast<uint8_t>(std::atoi(level_str));
-            if (admin_level < 2 || admin_level > 10) return;
-        } else {
-            admin_level = 11; // use 11 for postal codes
-        }
+        if (!is_admin && !is_place && !is_postal) return;
 
         const char* name = area.tags()["name"];
-        if (!name && is_admin) return;
 
-        // For postal codes, use postal_code tag as name
+        // Decide tag info + immediate semantic where possible.
+        PolyTagInfo tag{};
+        address_levels::Semantic semantic = address_levels::Semantic::None;
+        const char* country_code = nullptr;
         std::string name_str;
-        if (is_postal) {
+
+        if (is_admin) {
+            const char* level_str = area.tags()["admin_level"];
+            if (!level_str || !name) return;
+            int admin_level = std::atoi(level_str);
+            if (admin_level < 2 || admin_level > 12) return;
+
+            tag.kind = 0;
+            tag.level = static_cast<uint8_t>(admin_level);
+            name_str = name;
+
+            if (admin_level == 2) {
+                country_code = area.tags()["ISO3166-1:alpha2"];
+                if (!country_code) return;
+                semantic = address_levels::Semantic::Country;
+            }
+        } else if (is_place) {
+            const char* place = area.tags()["place"];
+            if (!place || !name) return;
+            tag.kind = 1;
+            tag.value = place;
+            name_str = name;
+        } else { // is_postal
             const char* postal_code = area.tags()["postal_code"];
             if (!postal_code) postal_code = name;
             if (!postal_code) return;
+            // No tag info needed - semantic is already final
             name_str = postal_code;
-        } else {
-            name_str = name;
+            semantic = address_levels::Semantic::Postcode;
         }
 
-        // Extract country code for level 2 boundaries
-        const char* country_code = (admin_level == 2)
-            ? area.tags()["ISO3166-1:alpha2"]
-            : nullptr;
-        if (admin_level == 2 && !country_code) return;
+        // Admin/place boundaries may also carry a postal_code tag
+        // (e.g. suburbs in Australia like Lyndhurst).
+        const char* extra_postal_code = (is_admin || is_place) ? area.tags()["postal_code"] : nullptr;
 
-        // Extract outer ring vertices
         for (const auto& outer_ring : area.outer_rings()) {
             std::vector<std::pair<double,double>> vertices;
             for (const auto& node_ref : outer_ring) {
@@ -553,14 +588,19 @@ public:
                     vertices.emplace_back(node_ref.location().lat(), node_ref.location().lon());
                 }
             }
-            if (vertices.size() >= 3) {
-                add_admin_polygon(vertices, name_str.c_str(), admin_level, country_code);
+            if (vertices.size() < 3) continue;
+
+            add_admin_polygon(vertices, name_str.c_str(), semantic, tag, country_code);
+            if (extra_postal_code) {
+                PolyTagInfo none{};
+                add_admin_polygon(vertices, extra_postal_code,
+                                  address_levels::Semantic::Postcode, none, nullptr);
             }
         }
 
         admin_count_++;
         if (admin_count_ % 10000 == 0) {
-            std::cerr << "Processed " << admin_count_ / 1000 << "K admin boundaries..." << std::endl;
+            std::cerr << "Processed " << admin_count_ / 1000 << "K admin/place boundaries..." << std::endl;
         }
     }
 
@@ -568,25 +608,15 @@ public:
     uint64_t building_addr_count() const { return building_addr_count_; }
     uint64_t interp_count() const { return interp_count_; }
     uint64_t admin_count() const { return admin_count_; }
-    uint64_t place_count() const { return place_count_; }
 
 private:
     uint64_t way_count_ = 0;
     uint64_t building_addr_count_ = 0;
     uint64_t interp_count_ = 0;
     uint64_t admin_count_ = 0;
-    uint64_t place_count_ = 0;
 
-    void process_place(const osmium::Node& node, const char* name, uint8_t place_type) {
-        add_place_point(node.location().lat(), node.location().lon(), name, place_type);
-
-        place_count_++;
-        if (place_count_ % 100000 == 0) {
-            std::cerr << "Collected " << place_count_ / 1000 << "K place points..." << std::endl;
-        }
-    }
-
-    void process_building_address(const osmium::Way& way, const char* housenumber, const char* street) {
+    void process_building_address(const osmium::Way& way, const char* housenumber, const char* street,
+                                   const char* city, const char* suburb, const char* postcode) {
         const auto& wnodes = way.nodes();
         if (wnodes.empty()) return;
 
@@ -600,7 +630,7 @@ private:
         }
         if (valid == 0) return;
 
-        add_addr_point(sum_lat / valid, sum_lng / valid, housenumber, street);
+        add_addr_point(sum_lat / valid, sum_lng / valid, housenumber, street, city, suburb, postcode);
         building_addr_count_++;
     }
 
@@ -825,6 +855,117 @@ static void write_cell_index(
     }
 }
 
+// --- Resolve semantic level for each polygon ---
+//
+// For each polygon whose semantic is still None, look up its parent country
+// (by point-in-polygon against country polygons on the centroid), then map
+// (country, tag) -> rank -> semantic via the Nominatim ruleset.
+static bool point_in_polygon_f64(double lat, double lng, const NodeCoord* verts, size_t n) {
+    bool inside = false;
+    size_t j = n - 1;
+    for (size_t i = 0; i < n; i++) {
+        double vi_lat = verts[i].lat, vi_lng = verts[i].lng;
+        double vj_lat = verts[j].lat, vj_lng = verts[j].lng;
+        if ((vi_lng > lng) != (vj_lng > lng) &&
+            lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    return inside;
+}
+
+static void resolve_semantic_levels() {
+    // Collect country polygons with bounding boxes for fast PIP prefilter.
+    struct Country {
+        uint32_t poly_id;
+        char code[3]; // null-terminated lowercase
+        float min_lat, max_lat;
+        float min_lng, max_lng;
+    };
+    std::vector<Country> countries;
+    for (uint32_t i = 0; i < admin_polygons.size(); i++) {
+        const auto& p = admin_polygons[i];
+        if (p.semantic != (uint8_t)address_levels::Semantic::Country || p.country_code == 0) continue;
+        Country c{};
+        c.poly_id = i;
+        c.code[0] = std::tolower((p.country_code >> 8) & 0xFF);
+        c.code[1] = std::tolower(p.country_code & 0xFF);
+        c.code[2] = 0;
+        const NodeCoord* verts = admin_vertices.data() + p.vertex_offset;
+        c.min_lat = c.max_lat = verts[0].lat;
+        c.min_lng = c.max_lng = verts[0].lng;
+        for (uint32_t v = 1; v < p.vertex_count; v++) {
+            c.min_lat = std::min(c.min_lat, verts[v].lat);
+            c.max_lat = std::max(c.max_lat, verts[v].lat);
+            c.min_lng = std::min(c.min_lng, verts[v].lng);
+            c.max_lng = std::max(c.max_lng, verts[v].lng);
+        }
+        countries.push_back(c);
+    }
+
+    auto find_country = [&](double lat, double lng) -> const char* {
+        const char* code = nullptr;
+        float best_area = std::numeric_limits<float>::infinity();
+        for (const auto& c : countries) {
+            const auto& cp = admin_polygons[c.poly_id];
+            if (cp.area >= best_area) continue;
+            if (lat < c.min_lat || lat > c.max_lat ||
+                lng < c.min_lng || lng > c.max_lng) continue;
+            const NodeCoord* cverts = admin_vertices.data() + cp.vertex_offset;
+            if (point_in_polygon_f64(lat, lng, cverts, cp.vertex_count)) {
+                code = c.code;
+                best_area = cp.area;
+            }
+        }
+        return code;
+    };
+
+    uint32_t resolved_polys = 0;
+    for (uint32_t i = 0; i < admin_polygons.size(); i++) {
+        auto& p = admin_polygons[i];
+        if (p.semantic != (uint8_t)address_levels::Semantic::None) continue;
+
+        const NodeCoord* verts = admin_vertices.data() + p.vertex_offset;
+        double cx = 0, cy = 0;
+        for (uint32_t j = 0; j < p.vertex_count; j++) {
+            cx += verts[j].lat;
+            cy += verts[j].lng;
+        }
+        cx /= p.vertex_count;
+        cy /= p.vertex_count;
+
+        const char* country_code = find_country(cx, cy);
+        address_levels::Semantic sem = address_levels::Semantic::None;
+        const auto& tag = poly_tag_info[i];
+        if (tag.kind == 0) {
+            sem = address_levels::lookup_admin(country_code, tag.level);
+        } else {
+            sem = address_levels::lookup_place(tag.value.c_str(), true /* polygon */);
+        }
+        p.semantic = static_cast<uint8_t>(sem);
+        if (sem != address_levels::Semantic::None) resolved_polys++;
+    }
+
+    uint32_t resolved_places = 0;
+    for (uint32_t i = 0; i < place_nodes.size(); i++) {
+        auto& n = place_nodes[i];
+        const char* country_code = find_country(n.lat, n.lng);
+        address_levels::Semantic sem = address_levels::lookup_place(
+            place_node_tag_info[i].place_type.c_str(), false /* node */);
+        n.semantic = static_cast<uint8_t>(sem);
+        n.country_code = (country_code && country_code[0] && country_code[1])
+            ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
+            : 0;
+        if (sem != address_levels::Semantic::None) resolved_places++;
+    }
+
+    std::cerr << "Resolved semantic level for " << resolved_polys << "/"
+              << admin_polygons.size() << " polygons, "
+              << resolved_places << "/" << place_nodes.size() << " place nodes ("
+              << countries.size() << " country polygons)" << std::endl;
+}
+
 // --- Write all index files ---
 
 static void write_index(const std::string& output_dir) {
@@ -863,7 +1004,7 @@ static void write_index(const std::string& output_dir) {
     std::cerr << "admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
 
     write_cell_index(output_dir + "/place_cells.bin", output_dir + "/place_entries.bin", cell_to_places);
-    std::cerr << "place index: " << cell_to_places.size() << " cells, " << place_points.size() << " points" << std::endl;
+    std::cerr << "place index: " << cell_to_places.size() << " cells, " << place_nodes.size() << " nodes" << std::endl;
 
     // Street ways
     {
@@ -907,10 +1048,10 @@ static void write_index(const std::string& output_dir) {
         f.write(reinterpret_cast<const char*>(admin_vertices.data()), admin_vertices.size() * sizeof(NodeCoord));
     }
 
-    // Place points
+    // Place nodes
     {
-        std::ofstream f(output_dir + "/place_points.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(place_points.data()), place_points.size() * sizeof(PlacePoint));
+        std::ofstream f(output_dir + "/place_nodes.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(place_nodes.data()), place_nodes.size() * sizeof(PlaceNode));
     }
 
     // Strings
@@ -943,6 +1084,9 @@ int main(int argc, char* argv[]) {
             input_files.push_back(arg);
         }
     }
+
+    // Reserve string offset 0 for the empty string (used as a "not present" marker).
+    strings.intern("");
 
     BuildHandler handler;
 
@@ -991,10 +1135,16 @@ int main(int argc, char* argv[]) {
     std::cerr << "  " << handler.interp_count() << " interpolation ways" << std::endl;
     std::cerr << "  " << handler.admin_count() << " admin/postcode boundaries ("
               << admin_polygons.size() << " polygon rings)" << std::endl;
-    std::cerr << "  " << handler.place_count() << " place points" << std::endl;
 
     std::cerr << "Resolving interpolation endpoints..." << std::endl;
     resolve_interpolation_endpoints();
+
+    std::cerr << "Resolving semantic levels..." << std::endl;
+    resolve_semantic_levels();
+    poly_tag_info.clear();
+    poly_tag_info.shrink_to_fit();
+    place_node_tag_info.clear();
+    place_node_tag_info.shrink_to_fit();
 
     std::cerr << "Deduplicating..." << std::endl;
     deduplicate(cell_to_ways);

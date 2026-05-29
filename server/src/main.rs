@@ -18,14 +18,6 @@ use std::sync::{Arc, RwLock};
 const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
 const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
 const DEFAULT_SEARCH_DISTANCE: f64 = 75.0;
-const PLACE_SUBURB: u8 = 1;
-const PLACE_NEIGHBOURHOOD: u8 = 2;
-const PLACE_QUARTER: u8 = 3;
-const PLACE_CITY_DISTRICT: u8 = 4;
-const PLACE_SUBURB_MAX_DISTANCE: f64 = 5_000.0;
-const PLACE_NEIGHBOURHOOD_MAX_DISTANCE: f64 = 3_000.0;
-const PLACE_QUARTER_MAX_DISTANCE: f64 = 3_000.0;
-const PLACE_CITY_DISTRICT_MAX_DISTANCE: f64 = 5_000.0;
 
 fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
@@ -54,6 +46,9 @@ struct AddrPoint {
     lng: f32,
     housenumber_id: u32,
     street_id: u32,
+    city_id: u32,     // 0 = not present
+    suburb_id: u32,   // 0 = not present
+    postcode_id: u32, // 0 = not present
 }
 
 #[repr(C)]
@@ -73,19 +68,23 @@ struct AdminPolygon {
     vertex_offset: u32,
     vertex_count: u16,
     name_id: u32,
-    admin_level: u8,
+    semantic: u8,
     area: f32,
     country_code: u16,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PlacePoint {
-    lat: f32,
-    lng: f32,
-    name_id: u32,
-    place_type: u8,
-}
+const SEM_NONE: u8 = 0;
+const SEM_COUNTRY: u8 = 1;
+const SEM_STATE: u8 = 2;
+const SEM_COUNTY: u8 = 3;
+const SEM_CITY: u8 = 4;
+const SEM_SUBURB: u8 = 5;
+const SEM_POSTCODE: u8 = 6;
+
+// Max distance from query to a place node when falling back (degrees, squared).
+// 20 km / 111320 m-per-degree.
+const PLACE_FALLBACK_MAX_DIST: f32 = (20000.0 / 111320.0) * (20000.0 / 111320.0);
+const SEM_COUNT: usize = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -94,10 +93,14 @@ struct NodeCoord {
     lng: f32,
 }
 
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct AdminCandidate<'a> {
-    area: f32,
-    poly: &'a AdminPolygon,
+struct PlaceNode {
+    lat: f32,
+    lng: f32,
+    name_id: u32,
+    semantic: u8,
+    country_code: u16, // packed ISO 3166-1 alpha-2, 0 = unknown
 }
 
 // --- Index data ---
@@ -116,13 +119,12 @@ struct Index {
     admin_entries: Mmap,
     admin_polygons: Mmap,
     admin_vertices: Mmap,
-    place_cells: Option<Mmap>,
-    place_entries: Option<Mmap>,
-    place_points: Option<Mmap>,
+    place_cells: Mmap,
+    place_entries: Mmap,
+    place_nodes: Mmap,
     strings: Mmap,
     street_cell_level: u64,
     admin_cell_level: u64,
-    max_distance_sq: f64,
 }
 
 const NO_DATA: u32 = 0xFFFFFFFF;
@@ -138,26 +140,8 @@ fn mmap_file(path: &str) -> Result<Mmap, String> {
     unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e)) }
 }
 
-fn mmap_optional_file(path: &str) -> Result<Option<Mmap>, String> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("Failed to open {}: {}", path, e)),
-    };
-    let len = file
-        .metadata()
-        .map_err(|e| format!("Failed to stat {}: {}", path, e))?
-        .len();
-    if len == 0 {
-        return Ok(None);
-    }
-    unsafe { Mmap::map(&file).map(Some).map_err(|e| format!("Failed to mmap {}: {}", path, e)) }
-}
-
 impl Index {
-    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
-        let meters_to_rad = search_distance / 111_320.0;
-        let max_distance_sq = meters_to_rad * meters_to_rad;
+    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64) -> Result<Self, String> {
         Ok(Index {
             geo_cells: mmap_file(&format!("{}/geo_cells.bin", dir))?,
             street_entries: mmap_file(&format!("{}/street_entries.bin", dir))?,
@@ -172,13 +156,12 @@ impl Index {
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
             admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
-            place_cells: mmap_optional_file(&format!("{}/place_cells.bin", dir))?,
-            place_entries: mmap_optional_file(&format!("{}/place_entries.bin", dir))?,
-            place_points: mmap_optional_file(&format!("{}/place_points.bin", dir))?,
+            place_cells: mmap_file(&format!("{}/place_cells.bin", dir))?,
+            place_entries: mmap_file(&format!("{}/place_entries.bin", dir))?,
+            place_nodes: mmap_file(&format!("{}/place_nodes.bin", dir))?,
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
-            max_distance_sq,
         })
     }
 
@@ -242,8 +225,8 @@ impl Index {
         empty
     }
 
-    // Binary search cell index with a single entries offset: 12 bytes per entry (u64 cell_id + u32 offset)
-    fn lookup_offset_cell(cells: &[u8], cell_id: u64) -> u32 {
+    // Binary search admin cell index: 12 bytes per entry (u64 cell_id + u32 offset)
+    fn lookup_admin_cell(cells: &[u8], cell_id: u64) -> u32 {
         let entry_size: usize = 12;
         let count = cells.len() / entry_size;
         if count == 0 { return NO_DATA; }
@@ -445,42 +428,71 @@ impl Index {
             )
         };
 
-        let mut candidates_by_level: [Vec<AdminCandidate<'_>>; 12] = std::array::from_fn(|_| Vec::new());
+        // For each semantic level, find the smallest-area polygon containing the point
+        let mut best_by_semantic: [Option<(f32, &AdminPolygon)>; SEM_COUNT] = [None; SEM_COUNT];
 
+        const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_offset_cell(&self.admin_cells, c), |id| {
+        for c in std::iter::once(cell).chain(neighbors.iter().copied()) {
+            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+                let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
                 let poly = &all_polygons[poly_id];
-                let level = poly.admin_level as usize;
-                if level >= 12 { return; }
+                let semantic = poly.semantic as usize;
+                if semantic == SEM_NONE as usize || semantic >= SEM_COUNT { return; }
 
-                if !polygon_contains_point(poly, all_vertices, lat as f32, lng as f32) {
-                    return;
+                if let Some((best_area, _)) = best_by_semantic[semantic] {
+                    if poly.area >= best_area { return; }
                 }
 
-                if candidates_by_level[level]
-                    .iter()
-                    .any(|candidate| std::ptr::eq(candidate.poly, poly))
-                {
-                    return;
+                if is_interior || point_in_polygon(lat as f32, lng as f32, {
+                    let offset = poly.vertex_offset as usize;
+                    let count = poly.vertex_count as usize;
+                    &all_vertices[offset..offset + count]
+                }) {
+                    best_by_semantic[semantic] = Some((poly.area, poly));
                 }
-
-                candidates_by_level[level].push(AdminCandidate { area: poly.area, poly });
             });
         }
 
-        let mut result = AdminResult::default();
-        let city = select_admin_candidate(&candidates_by_level[8], None, all_vertices);
-        let county = select_admin_candidate(&candidates_by_level[6], city, all_vertices);
-        let city_district = select_admin_candidate(&candidates_by_level[9], city, all_vertices);
-        let suburb = select_admin_candidate(&candidates_by_level[10], city.or(city_district), all_vertices);
-        let state = select_admin_candidate(&candidates_by_level[4], city.or(county), all_vertices);
-        let country = select_admin_candidate(&candidates_by_level[2], state.or(city).or(county), all_vertices);
-        let postcode = select_admin_candidate(&candidates_by_level[11], None, all_vertices);
+        // Fallback: nearest place node by semantic. Only consider nodes whose
+        // country matches the resolved country, to avoid cross-border leaks
+        // (e.g. a Luxembourg suburb showing up for a French point near the border).
+        let mut best_node_by_semantic: [Option<(f32, &PlaceNode)>; SEM_COUNT] = [None; SEM_COUNT];
+        let resolved_country = best_by_semantic[SEM_COUNTRY as usize].and_then(|(_, p)| {
+            if p.country_code != 0 { Some(p.country_code) } else { None }
+        });
+        if let Some(country) = resolved_country {
+            let all_places: &[PlaceNode] = unsafe {
+                std::slice::from_raw_parts(
+                    self.place_nodes.as_ptr() as *const PlaceNode,
+                    self.place_nodes.len() / std::mem::size_of::<PlaceNode>(),
+                )
+            };
+            let qlat = lat as f32;
+            let qlng = lng as f32;
+            for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+                Self::for_each_entry(&self.place_entries, Self::lookup_admin_cell(&self.place_cells, c), |id| {
+                    let node = &all_places[id as usize];
+                    let semantic = node.semantic as usize;
+                    if semantic == SEM_NONE as usize || semantic >= SEM_COUNT { return; }
+                    if best_by_semantic[semantic].is_some() { return; }
+                    if node.country_code != 0 && node.country_code != country { return; }
+                    let dx = node.lat - qlat;
+                    let dy = node.lng - qlng;
+                    let dist = dx * dx + dy * dy;
+                    if dist > PLACE_FALLBACK_MAX_DIST { return; }
+                    if let Some((best_d, _)) = best_node_by_semantic[semantic] {
+                        if dist >= best_d { return; }
+                    }
+                    best_node_by_semantic[semantic] = Some((dist, node));
+                });
+            }
+        }
 
-        if let Some(poly) = country {
+        let mut result = AdminResult::default();
+        if let Some((_, poly)) = best_by_semantic[SEM_COUNTRY as usize] {
             result.country = Some(self.get_string(poly.name_id));
             if poly.country_code != 0 {
                 result.country_code = Some([
@@ -489,108 +501,33 @@ impl Index {
                 ]);
             }
         }
-        if let Some(poly) = state {
-            result.state = Some(self.get_string(poly.name_id));
+
+        for (sem, slot) in [
+            (SEM_STATE,  &mut result.state),
+            (SEM_COUNTY, &mut result.county),
+            (SEM_CITY,   &mut result.city),
+            (SEM_SUBURB, &mut result.suburb),
+        ] {
+            if let Some((_, poly)) = best_by_semantic[sem as usize] {
+                *slot = Some(self.get_string(poly.name_id));
+            } else if let Some((_, node)) = best_node_by_semantic[sem as usize] {
+                *slot = Some(self.get_string(node.name_id));
+            }
         }
-        if let Some(poly) = county {
-            result.county = Some(self.get_string(poly.name_id));
-        }
-        if let Some(poly) = city {
-            result.city = Some(self.get_string(poly.name_id));
-        }
-        if let Some(poly) = city_district {
-            result.city_district = Some(self.get_string(poly.name_id));
-        }
-        if let Some(poly) = suburb {
-            result.suburb = Some(self.get_string(poly.name_id));
-        }
-        if let Some(poly) = postcode {
+
+        if let Some((_, poly)) = best_by_semantic[SEM_POSTCODE as usize] {
             result.postcode = Some(self.get_string(poly.name_id));
         }
-
-        result
-    }
-
-    fn find_places(&self, lat: f64, lng: f64) -> PlaceResult<'_> {
-        let (Some(place_cells), Some(place_entries), Some(place_points)) =
-            (&self.place_cells, &self.place_entries, &self.place_points)
-        else {
-            return PlaceResult::default();
-        };
-
-        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
-        let cos_lat = lat.to_radians().cos();
-
-        let all_points: &[PlacePoint] = unsafe {
-            std::slice::from_raw_parts(
-                place_points.as_ptr() as *const PlacePoint,
-                place_points.len() / std::mem::size_of::<PlacePoint>(),
-            )
-        };
-
-        let max_suburb_dist = meters_to_rad_sq(PLACE_SUBURB_MAX_DISTANCE);
-        let max_neighbourhood_dist = meters_to_rad_sq(PLACE_NEIGHBOURHOOD_MAX_DISTANCE);
-        let max_quarter_dist = meters_to_rad_sq(PLACE_QUARTER_MAX_DISTANCE);
-        let max_city_district_dist = meters_to_rad_sq(PLACE_CITY_DISTRICT_MAX_DISTANCE);
-
-        let mut result = PlaceResult::default();
-        let mut best_suburb: Option<f64> = None;
-        let mut best_neighbourhood: Option<f64> = None;
-        let mut best_quarter: Option<f64> = None;
-        let mut best_city_district: Option<f64> = None;
-
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(place_entries, Self::lookup_offset_cell(place_cells, c), |id| {
-                let Some(point) = all_points.get(id as usize) else {
-                    return;
-                };
-
-                let dlat = (lat - point.lat as f64).to_radians();
-                let dlng = (lng - point.lng as f64).to_radians();
-                let dist = dist_sq(dlat, dlng, cos_lat);
-                let name = self.get_string(point.name_id);
-
-                match point.place_type {
-                    PLACE_SUBURB if dist <= max_suburb_dist => {
-                        if best_suburb.is_none_or(|best| dist < best) {
-                            best_suburb = Some(dist);
-                            result.suburb = Some(name);
-                        }
-                    }
-                    PLACE_NEIGHBOURHOOD if dist <= max_neighbourhood_dist => {
-                        if best_neighbourhood.is_none_or(|best| dist < best) {
-                            best_neighbourhood = Some(dist);
-                            result.neighbourhood = Some(name);
-                        }
-                    }
-                    PLACE_QUARTER if dist <= max_quarter_dist => {
-                        if best_quarter.is_none_or(|best| dist < best) {
-                            best_quarter = Some(dist);
-                            result.quarter = Some(name);
-                        }
-                    }
-                    PLACE_CITY_DISTRICT if dist <= max_city_district_dist => {
-                        if best_city_district.is_none_or(|best| dist < best) {
-                            best_city_district = Some(dist);
-                            result.city_district = Some(name);
-                        }
-                    }
-                    _ => {}
-                }
-            });
-        }
-
         result
     }
 
     // --- Combined query ---
 
-    fn query(&self, lat: f64, lng: f64) -> Address<'_> {
-        let max_dist = self.max_distance_sq;
+    fn query(&self, lat: f64, lng: f64, search_distance: f64) -> Address<'_> {
+        let meters_to_rad = search_distance / 111_320.0;
+        let max_dist = meters_to_rad * meters_to_rad;
 
-        let mut admin = self.find_admin(lat, lng);
-        let places = self.find_places(lat, lng);
+        let admin = self.find_admin(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
 
         // Pick whichever is closer: the nearest house (address point or
@@ -602,6 +539,10 @@ impl Index {
         let addr = addr.filter(|(d, _)| *d < max_dist);
         let interp = interp.filter(|(d, _, _)| *d < max_dist);
         let street = street.filter(|(d, _)| *d < max_dist);
+
+        // Keep a reference to the matched address point so we can fall back to
+        // its addr:city / addr:suburb / addr:postcode tags below.
+        let matched_addr = addr.map(|(_, p)| p);
 
         let house = [
             addr.map(|(d, p)| (d, p.street_id, Cow::Borrowed(self.get_string(p.housenumber_id)))),
@@ -623,40 +564,104 @@ impl Index {
             road = Some(self.get_string(way.name_id));
         }
 
-        if admin.suburb.is_none() {
-            admin.suburb = places.suburb;
-        }
-        if admin.city_district.is_none() {
-            admin.city_district = places.city_district;
+        if road.is_none() && admin.country.is_none() && admin.city.is_none() {
+            return Address::default();
         }
 
-        let mut address = AddressDetails {
+        // Final fallback: addr:* tags from the matched address point
+        let mut city = admin.city;
+        let mut suburb = admin.suburb;
+        let mut postcode = admin.postcode;
+        if let Some(p) = matched_addr {
+            for (slot, id) in [
+                (&mut city,     p.city_id),
+                (&mut suburb,   p.suburb_id),
+                (&mut postcode, p.postcode_id),
+            ] {
+                if slot.is_none() && id != 0 {
+                    *slot = Some(self.get_string(id));
+                }
+            }
+        }
+
+        let address = AddressDetails {
             house_number,
             road,
-            city: admin.city,
-            city_district: admin.city_district,
-            suburb: admin.suburb,
-            neighbourhood: places.neighbourhood,
-            quarter: places.quarter,
+            suburb,
+            city,
             state: admin.state,
             county: admin.county,
-            postcode: admin.postcode,
+            postcode,
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
-        dedupe_address_details(&mut address);
-        if address.road.is_none()
-            && address.suburb.is_none()
-            && address.neighbourhood.is_none()
-            && address.quarter.is_none()
-            && address.city_district.is_none()
-            && address.country.is_none()
-            && address.city.is_none()
-        {
-            return Address::default();
-        }
         let display_name = format_address(&address);
         Address { display_name, address }
+    }
+
+    fn snap(&self, lat: f64, lng: f64, search_distance: f64) -> Option<Snap> {
+        let meters_to_rad = search_distance / 111_320.0;
+        let max_dist = meters_to_rad * meters_to_rad;
+
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+
+        let all_ways: &[WayHeader] = unsafe {
+            std::slice::from_raw_parts(
+                self.street_ways.as_ptr() as *const WayHeader,
+                self.street_ways.len() / std::mem::size_of::<WayHeader>(),
+            )
+        };
+        let all_street_nodes: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.street_nodes.as_ptr() as *const NodeCoord,
+                self.street_nodes.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+
+        let cos_lat = lat.to_radians().cos();
+
+        let mut best_dist = f64::MAX;
+        let mut best_lat = 0.0_f64;
+        let mut best_lng = 0.0_f64;
+
+        let mut seen_streets: [u32; 64] = [u32::MAX; 64];
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            let offsets = Self::lookup_geo_cell(&self.geo_cells, c);
+
+            Self::for_each_entry(&self.street_entries, offsets.street, |id| {
+                let slot = (id as usize) & 0x3F;
+                if seen_streets[slot] == id { return; }
+                seen_streets[slot] = id;
+
+                let way = &all_ways[id as usize];
+                let offset = way.node_offset as usize;
+                let count = way.node_count as usize;
+                let nodes = &all_street_nodes[offset..offset + count];
+
+                for i in 0..nodes.len() - 1 {
+                    let ax = nodes[i].lat as f64;
+                    let ay = nodes[i].lng as f64;
+                    let bx = nodes[i + 1].lat as f64;
+                    let by = nodes[i + 1].lng as f64;
+                    let (dist, t) = point_to_segment_with_t(lat, lng, ax, ay, bx, by, cos_lat);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_lat = ax + t * (bx - ax);
+                        best_lng = ay + t * (by - ay);
+                    }
+                }
+            });
+        }
+
+        if best_dist >= max_dist { return None; }
+
+        Some(Snap {
+            lat: best_lat,
+            lng: best_lng,
+            distance: best_dist.sqrt() * 111_320.0,
+        })
     }
 }
 
@@ -698,106 +703,6 @@ fn point_to_segment_distance(
     point_to_segment_with_t(px, py, ax, ay, bx, by, cos_lat).0
 }
 
-fn polygon_vertices<'a>(poly: &AdminPolygon, vertices: &'a [NodeCoord]) -> &'a [NodeCoord] {
-    let offset = poly.vertex_offset as usize;
-    let count = poly.vertex_count as usize;
-    &vertices[offset..offset + count]
-}
-
-fn polygon_contains_point(poly: &AdminPolygon, vertices: &[NodeCoord], lat: f32, lng: f32) -> bool {
-    point_in_polygon(lat, lng, polygon_vertices(poly, vertices))
-}
-
-fn polygon_centroid(vertices: &[NodeCoord]) -> Option<(f32, f32)> {
-    if vertices.len() < 3 {
-        return None;
-    }
-
-    let mut twice_area = 0.0f64;
-    let mut cx = 0.0f64;
-    let mut cy = 0.0f64;
-
-    for i in 0..vertices.len() {
-        let j = (i + 1) % vertices.len();
-        let cross = vertices[i].lng as f64 * vertices[j].lat as f64
-            - vertices[j].lng as f64 * vertices[i].lat as f64;
-        twice_area += cross;
-        cx += (vertices[i].lng as f64 + vertices[j].lng as f64) * cross;
-        cy += (vertices[i].lat as f64 + vertices[j].lat as f64) * cross;
-    }
-
-    if twice_area.abs() < f64::EPSILON {
-        return None;
-    }
-
-    Some(((cy / (3.0 * twice_area)) as f32, (cx / (3.0 * twice_area)) as f32))
-}
-
-fn polygon_compatibility_score(
-    candidate: &AdminPolygon,
-    child: &AdminPolygon,
-    vertices: &[NodeCoord],
-) -> usize {
-    let candidate_vertices = polygon_vertices(candidate, vertices);
-    let child_vertices = polygon_vertices(child, vertices);
-    let mut score = 0usize;
-
-    if let Some((lat, lng)) = polygon_centroid(child_vertices) {
-        if point_in_polygon(lat, lng, candidate_vertices) {
-            score += 100;
-        }
-    }
-
-    let step = (child_vertices.len() / 16).max(1);
-    for vertex in child_vertices.iter().step_by(step).take(16) {
-        if point_in_polygon(vertex.lat, vertex.lng, candidate_vertices) {
-            score += 1;
-        }
-    }
-
-    score
-}
-
-fn select_admin_candidate<'a>(
-    candidates: &[AdminCandidate<'a>],
-    child: Option<&AdminPolygon>,
-    vertices: &[NodeCoord],
-) -> Option<&'a AdminPolygon> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let mut sorted = candidates.to_vec();
-    sorted.sort_by(|a, b| a.area.total_cmp(&b.area));
-
-    if let Some(child) = child {
-        let mut best: Option<(usize, f32, &AdminPolygon)> = None;
-        for candidate in &sorted {
-            let score = polygon_compatibility_score(candidate.poly, child, vertices);
-            if score == 0 {
-                continue;
-            }
-
-            let replace = match best {
-                Some((best_score, best_area, _)) => {
-                    score > best_score || (score == best_score && candidate.area < best_area)
-                }
-                None => true,
-            };
-
-            if replace {
-                best = Some((score, candidate.area, candidate.poly));
-            }
-        }
-
-        if let Some((_, _, poly)) = best {
-            return Some(poly);
-        }
-    }
-
-    sorted.first().map(|candidate| candidate.poly)
-}
-
 // Ray casting point-in-polygon test
 fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     let mut inside = false;
@@ -828,17 +733,8 @@ struct AdminResult<'a> {
     state: Option<&'a str>,
     county: Option<&'a str>,
     city: Option<&'a str>,
-    city_district: Option<&'a str>,
     suburb: Option<&'a str>,
     postcode: Option<&'a str>,
-}
-
-#[derive(Default)]
-struct PlaceResult<'a> {
-    city_district: Option<&'a str>,
-    suburb: Option<&'a str>,
-    neighbourhood: Option<&'a str>,
-    quarter: Option<&'a str>,
 }
 
 #[derive(Serialize, Default)]
@@ -848,15 +744,9 @@ struct AddressDetails<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     road: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    city: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    city_district: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     suburb: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    neighbourhood: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quarter: Option<&'a str>,
+    city: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -874,6 +764,14 @@ struct Address<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
     address: AddressDetails<'a>,
+}
+
+#[derive(Serialize)]
+struct Snap {
+    lat: f64,
+    #[serde(rename = "lon")]
+    lng: f64,
+    distance: f64,
 }
 
 // Address formatting patterns by country code
@@ -894,57 +792,8 @@ fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
     }
 }
 
-fn meters_to_rad_sq(meters: f64) -> f64 {
-    let meters_to_rad = meters / 111_320.0;
-    meters_to_rad * meters_to_rad
-}
-
-fn normalized_name(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-}
-
-fn names_equal(a: Option<&str>, b: Option<&str>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => normalized_name(a) == normalized_name(b),
-        _ => false,
-    }
-}
-
-fn clear_if_duplicate(value: &mut Option<&str>, others: &[Option<&str>]) {
-    if others.iter().copied().any(|other| names_equal(*value, other)) {
-        *value = None;
-    }
-}
-
-fn push_unique_part(parts: &mut Vec<String>, value: &str) {
-    if parts.iter().any(|part| normalized_name(part) == normalized_name(value)) {
-        return;
-    }
-    parts.push(value.to_string());
-}
-
-fn dedupe_address_details(addr: &mut AddressDetails<'_>) {
-    clear_if_duplicate(&mut addr.suburb, &[addr.city]);
-    clear_if_duplicate(&mut addr.neighbourhood, &[addr.city, addr.suburb]);
-    clear_if_duplicate(
-        &mut addr.quarter,
-        &[addr.city, addr.suburb, addr.neighbourhood],
-    );
-    clear_if_duplicate(
-        &mut addr.city_district,
-        &[addr.city, addr.suburb, addr.neighbourhood, addr.quarter],
-    );
-}
-
 fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
-    if addr.road.is_none()
-        && addr.suburb.is_none()
-        && addr.neighbourhood.is_none()
-        && addr.quarter.is_none()
-        && addr.city_district.is_none()
-        && addr.city.is_none()
-        && addr.country.is_none()
-    {
+    if addr.road.is_none() && addr.city.is_none() && addr.country.is_none() {
         return None;
     }
 
@@ -955,23 +804,13 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     if let Some(road) = addr.road {
         if let Some(ref hn) = addr.house_number {
             if number_after {
-                push_unique_part(&mut parts, &format!("{} {}", road, hn));
+                parts.push(format!("{} {}", road, hn));
             } else {
-                push_unique_part(&mut parts, &format!("{} {}", hn, road));
+                parts.push(format!("{} {}", hn, road));
             }
         } else {
-            push_unique_part(&mut parts, road);
+            parts.push(road.to_string());
         }
-    }
-
-    if let Some(suburb) = addr.suburb {
-        push_unique_part(&mut parts, suburb);
-    } else if let Some(neighbourhood) = addr.neighbourhood {
-        push_unique_part(&mut parts, neighbourhood);
-    } else if let Some(quarter) = addr.quarter {
-        push_unique_part(&mut parts, quarter);
-    } else if let Some(city_district) = addr.city_district {
-        push_unique_part(&mut parts, city_district);
     }
 
     // City + postcode + state
@@ -991,7 +830,7 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
             }
         }
         if !city_part.is_empty() {
-            push_unique_part(&mut parts, city_part.trim());
+            parts.push(city_part.trim().to_string());
         }
     } else {
         let mut city_part = String::new();
@@ -1009,123 +848,16 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
             city_part.push_str(pc);
         }
         if !city_part.is_empty() {
-            push_unique_part(&mut parts, &city_part);
+            parts.push(city_part);
         }
     }
 
     // Country
     if let Some(country) = addr.country {
-        push_unique_part(&mut parts, country);
+        parts.push(country.to_string());
     }
 
     if parts.is_empty() { None } else { Some(parts.join(", ")) }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const NAME_PERNAMBUCO: u32 = 1;
-    const NAME_PARAIBA: u32 = 2;
-    const NAME_SANTA_TEREZINHA: u32 = 3;
-
-    fn add_polygon(
-        vertices: &mut Vec<NodeCoord>,
-        points: &[(f32, f32)],
-        name_id: u32,
-        admin_level: u8,
-        area: f32,
-    ) -> AdminPolygon {
-        let vertex_offset = vertices.len() as u32;
-        vertices.extend(points.iter().map(|(lat, lng)| NodeCoord {
-            lat: *lat,
-            lng: *lng,
-        }));
-        AdminPolygon {
-            vertex_offset,
-            vertex_count: points.len() as u16,
-            name_id,
-            admin_level,
-            area,
-            country_code: 0,
-        }
-    }
-
-    #[test]
-    fn regression_border_state_prefers_pernambuco_for_santa_terezinha_coordinate() {
-        let query_lat = -7.373068f32;
-        let query_lng = -37.480312f32;
-        let mut vertices = Vec::new();
-
-        let city = add_polygon(
-            &mut vertices,
-            &[
-                (-7.3780, -37.4820),
-                (-7.3780, -37.4650),
-                (-7.3620, -37.4650),
-                (-7.3620, -37.4820),
-            ],
-            NAME_SANTA_TEREZINHA,
-            8,
-            0.001,
-        );
-        let pernambuco = add_polygon(
-            &mut vertices,
-            &[
-                (-7.5000, -37.6500),
-                (-7.5000, -37.3500),
-                (-7.2500, -37.3500),
-                (-7.2500, -37.6500),
-            ],
-            NAME_PERNAMBUCO,
-            4,
-            10.0,
-        );
-        let paraiba = add_polygon(
-            &mut vertices,
-            &[
-                (-7.3850, -37.4850),
-                (-7.3850, -37.4780),
-                (-7.3650, -37.4780),
-                (-7.3650, -37.4850),
-            ],
-            NAME_PARAIBA,
-            4,
-            0.0001,
-        );
-
-        assert!(polygon_contains_point(&city, &vertices, query_lat, query_lng));
-        assert!(polygon_contains_point(&pernambuco, &vertices, query_lat, query_lng));
-        assert!(polygon_contains_point(&paraiba, &vertices, query_lat, query_lng));
-
-        let selected_city = select_admin_candidate(
-            &[AdminCandidate {
-                area: city.area,
-                poly: &city,
-            }],
-            None,
-            &vertices,
-        )
-        .unwrap();
-        let selected_state = select_admin_candidate(
-            &[
-                AdminCandidate {
-                    area: paraiba.area,
-                    poly: &paraiba,
-                },
-                AdminCandidate {
-                    area: pernambuco.area,
-                    poly: &pernambuco,
-                },
-            ],
-            Some(selected_city),
-            &vertices,
-        )
-        .unwrap();
-
-        assert_eq!(selected_city.name_id, NAME_SANTA_TEREZINHA);
-        assert_eq!(selected_state.name_id, NAME_PERNAMBUCO);
-    }
 }
 
 #[derive(Deserialize)]
@@ -1133,6 +865,30 @@ struct QueryParams {
     lat: f64,
     lon: f64,
     key: Option<String>,
+    distance: Option<f64>,
+}
+
+fn authorize(
+    key: &Option<String>,
+    db: &RwLock<auth::Db>,
+    limiter: &auth::RateLimiter,
+    addr: std::net::SocketAddr,
+) -> Result<(), Response> {
+    let key = key.as_deref()
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing API key").into_response())?;
+
+    let (login, rps, rpd, by_ip) = db.read().unwrap().validate_token(key)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
+
+    let rate_key = if by_ip { format!("{}:{}", login, addr.ip()) } else { login };
+
+    auth::check_rate(limiter, &rate_key, rps, rpd)
+        .map_err(|msg| (StatusCode::TOO_MANY_REQUESTS, msg).into_response())
+}
+
+fn json_response<T: Serialize>(value: &T) -> Response {
+    let json = serde_json::to_string(value).unwrap_or_default();
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
 }
 
 async fn reverse_geocode(
@@ -1142,29 +898,26 @@ async fn reverse_geocode(
     limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    let key = match params.key {
-        Some(k) => k,
-        None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
-    };
+    if let Err(r) = authorize(&params.key, &state, &limiter, connect_info.0) { return r; }
 
-    let (login, rps, rpd, by_ip) = match state.read().unwrap().validate_token(&key) {
-        Some(info) => info,
-        None => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
-    };
+    let search_distance = params.distance.unwrap_or(DEFAULT_SEARCH_DISTANCE);
+    json_response(&index.query(params.lat, params.lon, search_distance))
+}
 
-    let rate_key = if by_ip {
-        format!("{}:{}", login, connect_info.0.ip())
-    } else {
-        login
-    };
+async fn snap_to_road(
+    Query(params): Query<QueryParams>,
+    state: axum::extract::State<Arc<RwLock<auth::Db>>>,
+    index: axum::extract::Extension<Arc<Index>>,
+    limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
+    connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if let Err(r) = authorize(&params.key, &state, &limiter, connect_info.0) { return r; }
 
-    if let Err(msg) = auth::check_rate(&limiter, &rate_key, rps, rpd) {
-        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    let search_distance = params.distance.unwrap_or(DEFAULT_SEARCH_DISTANCE);
+    match index.snap(params.lat, params.lon, search_distance) {
+        Some(s) => json_response(&s),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
-
-    let address = index.query(params.lat, params.lon);
-    let json = serde_json::to_string(&address).unwrap_or_default();
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
 }
 
 #[tokio::main]
@@ -1177,13 +930,13 @@ async fn main() {
     };
     let street_cell_level = arg_value("--street-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_STREET_CELL_LEVEL);
     let admin_cell_level = arg_value("--admin-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_ADMIN_CELL_LEVEL);
-    let search_distance = arg_value("--search-distance").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SEARCH_DISTANCE);
 
     let db_path = format!("{}/geocoder.json", data_dir);
     let db = auth::Db::load(&db_path);
 
-    eprintln!("Loading index from {}...", data_dir);
-    let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
+    let index_dir = format!("{}/index", data_dir);
+    eprintln!("Loading index from {}...", index_dir);
+    let index = match Index::load(&index_dir, street_cell_level, admin_cell_level) {
         Ok(idx) => Arc::new(idx),
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -1196,6 +949,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/reverse", get(reverse_geocode))
+        .route("/snap", get(snap_to_road))
         .merge(auth::router())
         .layer(axum::Extension(index))
         .layer(axum::Extension(limiter))
