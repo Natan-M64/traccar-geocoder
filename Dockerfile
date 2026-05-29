@@ -36,7 +36,8 @@ COPY --from=builder-cpp /src/build/build-index /usr/local/bin/
 COPY --from=builder-rust /src/server/target/release/query-server /usr/local/bin/
 COPY entrypoint.sh /usr/local/bin/
 
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["entrypoint.sh"]
 CMD ["auto"]

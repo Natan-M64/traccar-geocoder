@@ -1,8 +1,9 @@
 services:
   geocoder:
-    image: traccar/traccar-geocoder
+    image: ghcr.io/natan-m64/traccar-geocoder:admin-resolution-split
+    pull_policy: always
     environment:
-      - PBF_URLS=https://download.geofabrik.de/europe/monaco-latest.osm.pbf
+      - PBF_URLS=https://download.geofabrik.de/south-america/brazil/nordeste-latest.osm.pbf
     ports:
       - "3000:3000"
     volumes:
