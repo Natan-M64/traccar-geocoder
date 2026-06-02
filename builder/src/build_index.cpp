@@ -506,12 +506,14 @@ public:
         const char* place = node.tags()["place"];
         const char* name = node.tags()["name"];
         if (place && name) {
+            auto semantic = address_levels::lookup_place(place, false /* node */);
+            if (semantic == address_levels::Semantic::None) return;
             uint8_t place_type = local_place_type(place);
             uint32_t place_id = static_cast<uint32_t>(place_nodes.size());
             place_nodes.push_back({
                 static_cast<float>(lat), static_cast<float>(lng),
                 strings.intern(name),
-                0 /* semantic filled in post-pass */,
+                static_cast<uint8_t>(semantic),
                 place_type,
                 0 /* country_code filled in post-pass */
             });
