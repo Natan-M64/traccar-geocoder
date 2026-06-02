@@ -3,7 +3,7 @@ name: Publish Docker Image
 on:
   push:
     branches:
-      - '**'
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -42,6 +42,6 @@ jobs:
           platforms: linux/amd64
           push: true
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
