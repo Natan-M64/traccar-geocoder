@@ -583,6 +583,11 @@ impl Index {
                 }
             }
         }
+        if let (Some(s), Some(c)) = (suburb, city) {
+            if same_name(s, c) {
+                suburb = None;
+            }
+        }
 
         let address = AddressDetails {
             house_number,
@@ -792,6 +797,17 @@ fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
     }
 }
 
+fn same_name(a: &str, b: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    normalize(a) == normalize(b)
+}
+
 fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     if addr.road.is_none() && addr.city.is_none() && addr.country.is_none() {
         return None;
@@ -810,6 +826,12 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
             }
         } else {
             parts.push(road.to_string());
+        }
+    }
+
+    if let Some(suburb) = addr.suburb {
+        if addr.city.map_or(true, |city| !same_name(suburb, city)) {
+            parts.push(suburb.to_string());
         }
     }
 
