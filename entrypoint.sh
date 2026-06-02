@@ -2,6 +2,14 @@
 set -e
 
 DATA_DIR="${DATA_DIR:-/data}"
+INDEX_VERSION="${INDEX_VERSION:-2026-06-02-neighbourhood-suburb}"
+
+migrate_db() {
+    if [ ! -f "$DATA_DIR/geocoder.json" ] && [ -f "$DATA_DIR/index/geocoder.json" ]; then
+        echo "Migrating geocoder.json out of index folder..."
+        mv "$DATA_DIR/index/geocoder.json" "$DATA_DIR/geocoder.json"
+    fi
+}
 
 download_pbf() {
     mkdir -p "$DATA_DIR/pbf"
@@ -25,24 +33,33 @@ build_index() {
         echo "Error: no PBF files found in $DATA_DIR/pbf/"
         exit 1
     fi
-    if [ -f "$DATA_DIR/index/geo_cells.bin" ]; then
+    if [ -f "$DATA_DIR/index/geo_cells.bin" ] && [ -f "$DATA_DIR/index/.index_version" ] && [ "$(cat "$DATA_DIR/index/.index_version")" = "$INDEX_VERSION" ]; then
         echo "Index already exists, skipping build"
         return
     fi
-    mkdir -p "$DATA_DIR/index"
+    if [ -f "$DATA_DIR/index/geo_cells.bin" ]; then
+        echo "Index version changed, rebuilding index..."
+    fi
     level_args=""
     [ -n "$STREET_LEVEL" ] && level_args="$level_args --street-level $STREET_LEVEL"
     [ -n "$ADMIN_LEVEL" ] && level_args="$level_args --admin-level $ADMIN_LEVEL"
+    tmp_index="$DATA_DIR/index.tmp.$$"
+    old_index="$DATA_DIR/index.old.$$"
+    rm -rf "$tmp_index"
+    mkdir -p "$tmp_index"
     echo "Building index..."
-    build-index "$DATA_DIR/index" $files $level_args
+    build-index "$tmp_index" $files $level_args
+    printf '%s\n' "$INDEX_VERSION" > "$tmp_index/.index_version"
+    if [ -d "$DATA_DIR/index" ]; then
+        mv "$DATA_DIR/index" "$old_index"
+    fi
+    mv "$tmp_index" "$DATA_DIR/index"
+    rm -rf "$old_index"
     echo "Index built."
 }
 
 serve() {
-    if [ ! -f "$DATA_DIR/geocoder.json" ] && [ -f "$DATA_DIR/index/geocoder.json" ]; then
-        echo "Migrating geocoder.json out of index folder..."
-        mv "$DATA_DIR/index/geocoder.json" "$DATA_DIR/geocoder.json"
-    fi
+    migrate_db
     args="$DATA_DIR"
     if [ -n "$DOMAIN" ]; then
         args="$args --domain $DOMAIN"
@@ -62,6 +79,7 @@ serve() {
 case "${1:-auto}" in
     build)
         download_pbf
+        migrate_db
         build_index
         ;;
     serve)
@@ -69,6 +87,7 @@ case "${1:-auto}" in
         ;;
     auto)
         download_pbf
+        migrate_db
         build_index
         serve
         ;;
