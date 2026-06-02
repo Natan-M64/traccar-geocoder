@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY builder/ builder/
-RUN mkdir build && cd build && cmake ../builder && make -j$(nproc)
+RUN mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release ../builder && make -j$(nproc)
 
 # Stage 2: Build Rust server
 FROM rust:bookworm AS builder-rust

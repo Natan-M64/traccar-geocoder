@@ -86,6 +86,7 @@ struct PlaceNode {
     float lng;
     uint32_t name_id;
     uint8_t semantic;     // address_levels::Semantic
+    uint8_t place_type;   // local place tag type, uses the previous padding byte
     uint16_t country_code; // packed ISO 3166-1 alpha-2, 0 = unknown
 };
 
@@ -148,6 +149,22 @@ static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 static std::vector<PlaceNode> place_nodes;
 static std::vector<PlaceNodeTagInfo> place_node_tag_info; // parallel to place_nodes (build-time only)
 static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_places;
+
+static constexpr uint8_t PLACE_TYPE_NONE = 0;
+static constexpr uint8_t PLACE_TYPE_SUBURB = 1;
+static constexpr uint8_t PLACE_TYPE_NEIGHBOURHOOD = 2;
+static constexpr uint8_t PLACE_TYPE_QUARTER = 3;
+static constexpr uint8_t PLACE_TYPE_CITY_DISTRICT = 4;
+
+static uint8_t local_place_type(const char* place) {
+    if (!place) return PLACE_TYPE_NONE;
+    if (std::strcmp(place, "borough") == 0) return PLACE_TYPE_SUBURB;
+    if (std::strcmp(place, "suburb") == 0) return PLACE_TYPE_SUBURB;
+    if (std::strcmp(place, "neighbourhood") == 0) return PLACE_TYPE_NEIGHBOURHOOD;
+    if (std::strcmp(place, "quarter") == 0) return PLACE_TYPE_QUARTER;
+    if (std::strcmp(place, "city_district") == 0) return PLACE_TYPE_CITY_DISTRICT;
+    return PLACE_TYPE_NONE;
+}
 
 // --- S2 helpers ---
 
@@ -489,10 +506,14 @@ public:
         const char* place = node.tags()["place"];
         const char* name = node.tags()["name"];
         if (place && name) {
+            uint8_t place_type = local_place_type(place);
             uint32_t place_id = static_cast<uint32_t>(place_nodes.size());
             place_nodes.push_back({
                 static_cast<float>(lat), static_cast<float>(lng),
-                strings.intern(name), 0 /* semantic filled in post-pass */
+                strings.intern(name),
+                0 /* semantic filled in post-pass */,
+                place_type,
+                0 /* country_code filled in post-pass */
             });
             place_node_tag_info.push_back({place});
             S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);

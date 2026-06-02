@@ -10,6 +10,7 @@ use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs::File;
 use std::sync::{Arc, RwLock};
 
@@ -27,6 +28,50 @@ fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
 fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
     let cell = CellID(cell_id);
     cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
+}
+
+fn nearby_cells_at_level(cell_id: u64, level: u64, rings: usize) -> Vec<u64> {
+    let mut result = vec![cell_id];
+    let mut seen = HashSet::from([cell_id]);
+    let mut frontier = vec![cell_id];
+
+    for _ in 0..rings {
+        let mut next = Vec::new();
+        for cell in frontier {
+            for neighbor in cell_neighbors_at_level(cell, level) {
+                if seen.insert(neighbor) {
+                    result.push(neighbor);
+                    next.push(neighbor);
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    result
+}
+
+fn same_country_code(a: u16, b: u16) -> bool {
+    fn lower_ascii(byte: u8) -> u8 {
+        if byte.is_ascii_uppercase() {
+            byte + 32
+        } else {
+            byte
+        }
+    }
+
+    lower_ascii((a >> 8) as u8) == lower_ascii((b >> 8) as u8)
+        && lower_ascii((a & 0xFF) as u8) == lower_ascii((b & 0xFF) as u8)
+}
+
+fn place_node_max_dist(place_type: u8) -> f32 {
+    match place_type {
+        PLACE_TYPE_SUBURB => PLACE_SUBURB_MAX_DIST,
+        PLACE_TYPE_NEIGHBOURHOOD => PLACE_NEIGHBOURHOOD_MAX_DIST,
+        PLACE_TYPE_QUARTER => PLACE_QUARTER_MAX_DIST,
+        PLACE_TYPE_CITY_DISTRICT => PLACE_CITY_DISTRICT_MAX_DIST,
+        _ => PLACE_FALLBACK_MAX_DIST,
+    }
 }
 
 // --- Binary format structs (must match C++ build pipeline) ---
@@ -84,7 +129,19 @@ const SEM_POSTCODE: u8 = 6;
 // Max distance from query to a place node when falling back (degrees, squared).
 // 20 km / 111320 m-per-degree.
 const PLACE_FALLBACK_MAX_DIST: f32 = (20000.0 / 111320.0) * (20000.0 / 111320.0);
+const PLACE_SUBURB_MAX_DIST: f32 = (5000.0 / 111320.0) * (5000.0 / 111320.0);
+const PLACE_NEIGHBOURHOOD_MAX_DIST: f32 = (3000.0 / 111320.0) * (3000.0 / 111320.0);
+const PLACE_QUARTER_MAX_DIST: f32 = (3000.0 / 111320.0) * (3000.0 / 111320.0);
+const PLACE_CITY_DISTRICT_MAX_DIST: f32 = (5000.0 / 111320.0) * (5000.0 / 111320.0);
+const PLACE_FALLBACK_CELL_RINGS: usize = 3;
 const SEM_COUNT: usize = 7;
+
+const PLACE_TYPE_NONE: u8 = 0;
+const PLACE_TYPE_SUBURB: u8 = 1;
+const PLACE_TYPE_NEIGHBOURHOOD: u8 = 2;
+const PLACE_TYPE_QUARTER: u8 = 3;
+const PLACE_TYPE_CITY_DISTRICT: u8 = 4;
+const PLACE_TYPE_COUNT: usize = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -100,6 +157,7 @@ struct PlaceNode {
     lng: f32,
     name_id: u32,
     semantic: u8,
+    place_type: u8,
     country_code: u16, // packed ISO 3166-1 alpha-2, 0 = unknown
 }
 
@@ -460,6 +518,8 @@ impl Index {
         // country matches the resolved country, to avoid cross-border leaks
         // (e.g. a Luxembourg suburb showing up for a French point near the border).
         let mut best_node_by_semantic: [Option<(f32, &PlaceNode)>; SEM_COUNT] = [None; SEM_COUNT];
+        let mut best_local_node_by_type: [Option<(f32, &PlaceNode)>; PLACE_TYPE_COUNT] =
+            [None; PLACE_TYPE_COUNT];
         let resolved_country = best_by_semantic[SEM_COUNTRY as usize].and_then(|(_, p)| {
             if p.country_code != 0 { Some(p.country_code) } else { None }
         });
@@ -472,17 +532,25 @@ impl Index {
             };
             let qlat = lat as f32;
             let qlng = lng as f32;
-            for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            for c in nearby_cells_at_level(cell, self.admin_cell_level, PLACE_FALLBACK_CELL_RINGS) {
                 Self::for_each_entry(&self.place_entries, Self::lookup_admin_cell(&self.place_cells, c), |id| {
                     let node = &all_places[id as usize];
                     let semantic = node.semantic as usize;
                     if semantic == SEM_NONE as usize || semantic >= SEM_COUNT { return; }
-                    if best_by_semantic[semantic].is_some() { return; }
-                    if node.country_code != 0 && node.country_code != country { return; }
+                    if node.country_code != 0 && !same_country_code(node.country_code, country) { return; }
                     let dx = node.lat - qlat;
                     let dy = node.lng - qlng;
                     let dist = dx * dx + dy * dy;
-                    if dist > PLACE_FALLBACK_MAX_DIST { return; }
+                    if dist > place_node_max_dist(node.place_type) { return; }
+                    if semantic == SEM_SUBURB as usize
+                        && node.place_type != PLACE_TYPE_NONE
+                        && (node.place_type as usize) < PLACE_TYPE_COUNT
+                    {
+                        let slot = &mut best_local_node_by_type[node.place_type as usize];
+                        if slot.map_or(true, |(best_d, _)| dist < best_d) {
+                            *slot = Some((dist, node));
+                        }
+                    }
                     if let Some((best_d, _)) = best_node_by_semantic[semantic] {
                         if dist >= best_d { return; }
                     }
@@ -506,12 +574,35 @@ impl Index {
             (SEM_STATE,  &mut result.state),
             (SEM_COUNTY, &mut result.county),
             (SEM_CITY,   &mut result.city),
-            (SEM_SUBURB, &mut result.suburb),
         ] {
             if let Some((_, poly)) = best_by_semantic[sem as usize] {
                 *slot = Some(self.get_string(poly.name_id));
             } else if let Some((_, node)) = best_node_by_semantic[sem as usize] {
                 *slot = Some(self.get_string(node.name_id));
+            }
+        }
+        if let Some((_, poly)) = best_by_semantic[SEM_SUBURB as usize] {
+            let suburb = self.get_string(poly.name_id);
+            if result.city.map_or(true, |city| !same_name(suburb, city)) {
+                result.suburb = Some(suburb);
+            }
+        }
+        if result.suburb.is_none() {
+            for place_type in [
+                PLACE_TYPE_NEIGHBOURHOOD,
+                PLACE_TYPE_QUARTER,
+                PLACE_TYPE_SUBURB,
+                PLACE_TYPE_CITY_DISTRICT,
+            ] {
+                if let Some((_, node)) = best_local_node_by_type[place_type as usize] {
+                    result.suburb = Some(self.get_string(node.name_id));
+                    break;
+                }
+            }
+        }
+        if result.suburb.is_none() {
+            if let Some((_, node)) = best_node_by_semantic[SEM_SUBURB as usize] {
+                result.suburb = Some(self.get_string(node.name_id));
             }
         }
 
