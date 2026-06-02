@@ -162,7 +162,8 @@ static const PlaceEntry kPlaces[] = {
     {"suburb",        Semantic::Suburb,  Semantic::Suburb},
     {"hamlet",        Semantic::None,    Semantic::City},   // hamlet only useful as node fallback
     {"quarter",       Semantic::Suburb,  Semantic::Suburb},
-    {"neighbourhood", Semantic::None,    Semantic::None},   // too granular
+    // Keep neighbourhood as suburb so consumers using %u still get the local area.
+    {"neighbourhood", Semantic::Suburb,   Semantic::Suburb},
 };
 
 // --- Lookup helpers ---
