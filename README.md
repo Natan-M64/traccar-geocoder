@@ -143,6 +143,16 @@ Status codes:
 
 The server includes a web dashboard for managing API keys. On first launch, navigate to the server URL in a browser to create an admin account. Once logged in, you can generate API keys and create additional users with configurable rate limits.
 
+For unattended deployments, you can bootstrap the admin account and a stable API key through environment variables instead of using the web UI:
+
+```bash
+GEOCODER_ADMIN_LOGIN=admin
+GEOCODER_ADMIN_PASSWORD=change-me
+GEOCODER_API_KEY=your-fixed-token
+```
+
+If `geocoder.json` does not exist yet, the server creates the admin user and persists the token into the mounted `/data` volume on first start. The web dashboard still works afterward for managing additional users and tokens.
+
 ## Architecture
 
 The project consists of two components:

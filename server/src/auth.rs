@@ -55,13 +55,21 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn load(path: &str) -> Self {
+    pub fn load(path: &str) -> Result<Self, String> {
         let mut db = match fs::read_to_string(path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => Db::default(),
+            Ok(data) => serde_json::from_str(&data)
+                .map_err(|e| format!("Failed to parse {}: {}", path, e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Db::default(),
+            Err(e) => return Err(format!("Failed to read {}: {}", path, e)),
         };
         db.path = path.to_string();
-        db
+        eprintln!(
+            "Loaded auth db from {} ({} users, {} tokens)",
+            path,
+            db.users.len(),
+            db.tokens.len()
+        );
+        Ok(db)
     }
 
     fn save(&self) {
@@ -70,6 +78,11 @@ impl Db {
     }
 
     fn create_user(&mut self, login: &str, password: &str, admin: bool, rate_per_second: u32, rate_per_day: u32, rate_by_ip: bool) {
+        self.insert_user(login, password, admin, rate_per_second, rate_per_day, rate_by_ip);
+        self.save();
+    }
+
+    fn insert_user(&mut self, login: &str, password: &str, admin: bool, rate_per_second: u32, rate_per_day: u32, rate_by_ip: bool) {
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hash failed");
         self.users.insert(login.to_string(), User {
             password_hash: hash,
@@ -78,7 +91,30 @@ impl Db {
             rate_per_day,
             rate_by_ip,
         });
-        self.save();
+    }
+
+    pub fn bootstrap(&mut self, login: &str, password: Option<&str>, token: Option<&str>) {
+        let mut changed = false;
+
+        if self.users.is_empty() {
+            if let Some(password) = password.filter(|p| !p.is_empty()) {
+                self.insert_user(login, password, true, 0, 0, false);
+                changed = true;
+            }
+        }
+
+        if let Some(token) = token.filter(|t| !t.is_empty()) {
+            if self.users.contains_key(login)
+                && self.tokens.get(token).map(|owner| owner != login).unwrap_or(true)
+            {
+                self.tokens.insert(token.to_string(), login.to_string());
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.save();
+        }
     }
 
     pub fn validate_token(&self, key: &str) -> Option<(String, u32, u32, bool)> {

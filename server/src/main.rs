@@ -932,7 +932,23 @@ async fn main() {
     let admin_cell_level = arg_value("--admin-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_ADMIN_CELL_LEVEL);
 
     let db_path = format!("{}/geocoder.json", data_dir);
-    let db = auth::Db::load(&db_path);
+    let mut db = match auth::Db::load(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let bootstrap_login = std::env::var("GEOCODER_ADMIN_LOGIN").unwrap_or_else(|_| "admin".to_string());
+    let bootstrap_password = std::env::var("GEOCODER_ADMIN_PASSWORD").ok();
+    let bootstrap_token = std::env::var("GEOCODER_API_KEY").ok();
+    db.bootstrap(&bootstrap_login, bootstrap_password.as_deref(), bootstrap_token.as_deref());
+    eprintln!(
+        "Auth bootstrap ready for login={} (password={}, token={})",
+        bootstrap_login,
+        bootstrap_password.as_deref().map(|_| "set").unwrap_or("unset"),
+        bootstrap_token.as_deref().map(|_| "set").unwrap_or("unset"),
+    );
 
     let index_dir = format!("{}/index", data_dir);
     eprintln!("Loading index from {}...", index_dir);
