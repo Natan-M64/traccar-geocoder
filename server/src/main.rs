@@ -127,13 +127,13 @@ const SEM_SUBURB: u8 = 5;
 const SEM_POSTCODE: u8 = 6;
 
 // Max distance from query to a place node when falling back (degrees, squared).
-// 20 km / 111320 m-per-degree.
-const PLACE_FALLBACK_MAX_DIST: f32 = (20000.0 / 111320.0) * (20000.0 / 111320.0);
+// Used for older indexes that do not carry a place_type byte.
+const PLACE_FALLBACK_MAX_DIST: f32 = (5000.0 / 111320.0) * (5000.0 / 111320.0);
 const PLACE_SUBURB_MAX_DIST: f32 = (5000.0 / 111320.0) * (5000.0 / 111320.0);
 const PLACE_NEIGHBOURHOOD_MAX_DIST: f32 = (3000.0 / 111320.0) * (3000.0 / 111320.0);
 const PLACE_QUARTER_MAX_DIST: f32 = (3000.0 / 111320.0) * (3000.0 / 111320.0);
 const PLACE_CITY_DISTRICT_MAX_DIST: f32 = (5000.0 / 111320.0) * (5000.0 / 111320.0);
-const PLACE_FALLBACK_CELL_RINGS: usize = 3;
+const PLACE_FALLBACK_CELL_RINGS: usize = 1;
 const SEM_COUNT: usize = 7;
 
 const PLACE_TYPE_NONE: u8 = 0;
