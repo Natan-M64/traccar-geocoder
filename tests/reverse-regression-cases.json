@@ -1,0 +1,23 @@
+{
+  "description": "Critical reverse-geocoding regression cases for custom deployments.",
+  "notes": [
+    "Regional extracts can miss country polygons, so country and country_code are intentionally not required here.",
+    "These cases focus on administrative border selection and locality details that previously regressed."
+  ],
+  "cases": [
+    {"name":"Santa Terezinha PE border case","lat":-7.373068,"lon":-37.480312,"expected":{"city":"Santa Terezinha","state":"Pernambuco"},"not_expected":{"state":"Paraíba"}},
+    {"name":"Santa Terezinha PE nearby 1","lat":-7.372500,"lon":-37.480000,"expected":{"state":"Pernambuco"},"not_expected":{"state":"Paraíba"}},
+    {"name":"Santa Terezinha PE nearby 2","lat":-7.374000,"lon":-37.481000,"expected":{"state":"Pernambuco"},"not_expected":{"state":"Paraíba"}},
+    {"name":"Santa Terezinha PE nearby 3","lat":-7.385000,"lon":-37.490000,"expected":{"state":"Pernambuco"},"not_expected":{"state":"Paraíba"}},
+    {"name":"Imaculada PB 1","lat":-7.364073,"lon":-37.500369,"expected":{"city":"Imaculada","state":"Paraíba"},"not_expected":{"state":"Pernambuco"}},
+    {"name":"Imaculada PB 2","lat":-7.387748,"lon":-37.511040,"expected":{"city":"Imaculada","state":"Paraíba"},"not_expected":{"state":"Pernambuco"}},
+    {"name":"Patos PB 1","lat":-7.037000,"lon":-37.308000,"expected":{"city":"Patos","state":"Paraíba"}},
+    {"name":"Patos PB 2","lat":-7.033000,"lon":-37.300000,"expected":{"city":"Patos","state":"Paraíba"}},
+    {"name":"Patos PB 3","lat":-7.026000,"lon":-37.298000,"expected":{"city":"Patos","state":"Paraíba"}},
+    {"name":"Tabira PE 1","lat":-7.520000,"lon":-37.531000,"expected":{"city":"Tabira","state":"Pernambuco"}},
+    {"name":"Tabira PE 2","lat":-7.52382166666667,"lon":-37.5292577777778,"expected":{"city":"Tabira","state":"Pernambuco"}},
+    {"name":"Campina Grande PB suburb","lat":-7.266580,"lon":-35.916898,"expected":{"city":"Campina Grande","suburb":"Acácio Figueiredo"}},
+    {"name":"João Pessoa PB suburb Bancários","lat":-7.148488,"lon":-34.841133,"expected":{"city":"João Pessoa","suburb":"Bancários"}},
+    {"name":"João Pessoa PB suburb Gramame","lat":-7.216567,"lon":-34.842891,"expected":{"city":"João Pessoa","suburb":"Gramame"}}
+  ]
+}
