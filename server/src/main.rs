@@ -74,6 +74,12 @@ fn place_node_max_dist(place_type: u8) -> f32 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AdminCandidate<'a> {
+    area: f32,
+    poly: &'a AdminPolygon,
+}
+
 // --- Binary format structs (must match C++ build pipeline) ---
 
 #[repr(C)]
@@ -486,8 +492,11 @@ impl Index {
             )
         };
 
-        // For each semantic level, find the smallest-area polygon containing the point
-        let mut best_by_semantic: [Option<(f32, &AdminPolygon)>; SEM_COUNT] = [None; SEM_COUNT];
+        // Collect all polygons that contain the query point so we can later
+        // choose a compatible parent chain instead of mixing polygons from
+        // different administrative branches.
+        let mut candidates_by_semantic: [Vec<AdminCandidate<'_>>; SEM_COUNT] =
+            std::array::from_fn(|_| Vec::new());
 
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
@@ -500,16 +509,15 @@ impl Index {
                 let semantic = poly.semantic as usize;
                 if semantic == SEM_NONE as usize || semantic >= SEM_COUNT { return; }
 
-                if let Some((best_area, _)) = best_by_semantic[semantic] {
-                    if poly.area >= best_area { return; }
-                }
-
                 if is_interior || point_in_polygon(lat as f32, lng as f32, {
                     let offset = poly.vertex_offset as usize;
                     let count = poly.vertex_count as usize;
                     &all_vertices[offset..offset + count]
                 }) {
-                    best_by_semantic[semantic] = Some((poly.area, poly));
+                    candidates_by_semantic[semantic].push(AdminCandidate {
+                        area: poly.area,
+                        poly,
+                    });
                 }
             });
         }
@@ -520,9 +528,18 @@ impl Index {
         let mut best_node_by_semantic: [Option<(f32, &PlaceNode)>; SEM_COUNT] = [None; SEM_COUNT];
         let mut best_local_node_by_type: [Option<(f32, &PlaceNode)>; PLACE_TYPE_COUNT] =
             [None; PLACE_TYPE_COUNT];
-        let resolved_country = best_by_semantic[SEM_COUNTRY as usize].and_then(|(_, p)| {
-            if p.country_code != 0 { Some(p.country_code) } else { None }
-        });
+        let query_point = (lat as f32, lng as f32);
+        let query_support = [query_point];
+        let resolved_country = candidates_by_semantic[SEM_COUNTRY as usize]
+            .iter()
+            .min_by(|a, b| a.area.partial_cmp(&b.area).unwrap_or(std::cmp::Ordering::Equal))
+            .and_then(|candidate| {
+                if candidate.poly.country_code != 0 {
+                    Some(candidate.poly.country_code)
+                } else {
+                    None
+                }
+            });
         if let Some(country) = resolved_country {
             let all_places: &[PlaceNode] = unsafe {
                 std::slice::from_raw_parts(
@@ -560,7 +577,12 @@ impl Index {
         }
 
         let mut result = AdminResult::default();
-        if let Some((_, poly)) = best_by_semantic[SEM_COUNTRY as usize] {
+        let country_poly = select_admin_candidate(
+            &candidates_by_semantic[SEM_COUNTRY as usize],
+            all_vertices,
+            &query_support,
+        );
+        if let Some(poly) = country_poly {
             result.country = Some(self.get_string(poly.name_id));
             if poly.country_code != 0 {
                 result.country_code = Some([
@@ -570,18 +592,57 @@ impl Index {
             }
         }
 
-        for (sem, slot) in [
-            (SEM_STATE,  &mut result.state),
-            (SEM_COUNTY, &mut result.county),
-            (SEM_CITY,   &mut result.city),
-        ] {
-            if let Some((_, poly)) = best_by_semantic[sem as usize] {
-                *slot = Some(self.get_string(poly.name_id));
-            } else if let Some((_, node)) = best_node_by_semantic[sem as usize] {
-                *slot = Some(self.get_string(node.name_id));
-            }
+        let city_poly = select_admin_candidate(
+            &candidates_by_semantic[SEM_CITY as usize],
+            all_vertices,
+            &query_support,
+        );
+        if let Some(poly) = city_poly {
+            result.city = Some(self.get_string(poly.name_id));
+        } else if let Some((_, node)) = best_node_by_semantic[SEM_CITY as usize] {
+            result.city = Some(self.get_string(node.name_id));
         }
-        if let Some((_, poly)) = best_by_semantic[SEM_SUBURB as usize] {
+
+        let city_support_points = city_poly.map(|poly| polygon_support_points(poly, all_vertices, Some(query_point)));
+        // Use several support points from the selected child polygon so the
+        // parent branch must really contain the child, not just the query point.
+        let county_poly = select_admin_candidate(
+            &candidates_by_semantic[SEM_COUNTY as usize],
+            all_vertices,
+            city_support_points.as_deref().unwrap_or(&query_support),
+        );
+        if let Some(poly) = county_poly {
+            result.county = Some(self.get_string(poly.name_id));
+        } else if let Some((_, node)) = best_node_by_semantic[SEM_COUNTY as usize] {
+            result.county = Some(self.get_string(node.name_id));
+        }
+
+        let county_support_points =
+            county_poly.map(|poly| polygon_support_points(poly, all_vertices, Some(query_point)));
+        let state_preferred_points = city_support_points
+            .as_deref()
+            .or(county_support_points.as_deref())
+            .unwrap_or(&query_support);
+        let state_poly = select_admin_candidate(
+            &candidates_by_semantic[SEM_STATE as usize],
+            all_vertices,
+            state_preferred_points,
+        );
+        if let Some(poly) = state_poly {
+            result.state = Some(self.get_string(poly.name_id));
+        } else if let Some((_, node)) = best_node_by_semantic[SEM_STATE as usize] {
+            result.state = Some(self.get_string(node.name_id));
+        }
+
+        let suburb_preferred_points = city_support_points
+            .as_deref()
+            .or(county_support_points.as_deref())
+            .unwrap_or(&query_support);
+        if let Some(poly) = select_admin_candidate(
+            &candidates_by_semantic[SEM_SUBURB as usize],
+            all_vertices,
+            suburb_preferred_points,
+        ) {
             let suburb = self.get_string(poly.name_id);
             if result.city.map_or(true, |city| !same_name(suburb, city)) {
                 result.suburb = Some(suburb);
@@ -606,7 +667,11 @@ impl Index {
             }
         }
 
-        if let Some((_, poly)) = best_by_semantic[SEM_POSTCODE as usize] {
+        if let Some(poly) = select_admin_candidate(
+            &candidates_by_semantic[SEM_POSTCODE as usize],
+            all_vertices,
+            &[],
+        ) {
             result.postcode = Some(self.get_string(poly.name_id));
         }
         result
@@ -820,6 +885,121 @@ fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     inside
 }
 
+fn polygon_anchor(poly: &AdminPolygon, vertices: &[NodeCoord]) -> Option<(f32, f32)> {
+    let start = poly.vertex_offset as usize;
+    let count = poly.vertex_count as usize;
+    let slice = vertices.get(start..start + count)?;
+    if slice.is_empty() {
+        return None;
+    }
+
+    let mut sum_lat = 0.0_f32;
+    let mut sum_lng = 0.0_f32;
+    for v in slice {
+        sum_lat += v.lat;
+        sum_lng += v.lng;
+    }
+
+    Some((sum_lat / slice.len() as f32, sum_lng / slice.len() as f32))
+}
+
+fn polygon_support_points(
+    poly: &AdminPolygon,
+    vertices: &[NodeCoord],
+    query_point: Option<(f32, f32)>,
+) -> Vec<(f32, f32)> {
+    let mut points = Vec::with_capacity(4);
+
+    let mut push_unique = |point: (f32, f32)| {
+        if points.iter().any(|&existing| existing == point) {
+            return;
+        }
+        points.push(point);
+    };
+
+    if let Some(point) = query_point {
+        push_unique(point);
+    }
+
+    if let Some(anchor) = polygon_anchor(poly, vertices) {
+        push_unique(anchor);
+    }
+
+    let start = poly.vertex_offset as usize;
+    let count = poly.vertex_count as usize;
+    let Some(slice) = vertices.get(start..start + count) else {
+        return points;
+    };
+
+    if slice.len() <= 3 {
+        for v in slice {
+            push_unique((v.lat, v.lng));
+        }
+        return points;
+    }
+
+    let split = slice.len() / 2;
+    if split > 1 {
+        let mut sum_lat = 0.0_f32;
+        let mut sum_lng = 0.0_f32;
+        for v in &slice[..split] {
+            sum_lat += v.lat;
+            sum_lng += v.lng;
+        }
+        push_unique((sum_lat / split as f32, sum_lng / split as f32));
+
+        let tail = &slice[split..];
+        if !tail.is_empty() {
+            let mut sum_lat = 0.0_f32;
+            let mut sum_lng = 0.0_f32;
+            for v in tail {
+                sum_lat += v.lat;
+                sum_lng += v.lng;
+            }
+            push_unique((sum_lat / tail.len() as f32, sum_lng / tail.len() as f32));
+        }
+    }
+
+    points
+}
+
+fn select_admin_candidate<'a>(
+    candidates: &[AdminCandidate<'a>],
+    vertices: &[NodeCoord],
+    preferred_points: &[(f32, f32)],
+) -> Option<&'a AdminPolygon> {
+    let mut best: Option<(usize, AdminCandidate<'a>)> = None;
+
+    for candidate in candidates {
+        let start = candidate.poly.vertex_offset as usize;
+        let count = candidate.poly.vertex_count as usize;
+        let slice = match vertices.get(start..start + count) {
+            Some(slice) => slice,
+            None => continue,
+        };
+        if slice.is_empty() {
+            continue;
+        }
+
+        let score = preferred_points
+            .iter()
+            .filter(|&&(lat, lng)| point_in_polygon(lat, lng, slice))
+            .count();
+
+        let should_replace = best
+            .map(|(best_score, best_candidate)| {
+                score > best_score
+                    || (score == best_score && candidate.area < best_candidate.area)
+            })
+            .unwrap_or(true);
+        if should_replace {
+            best = Some((score, *candidate));
+        }
+    }
+
+    best.map(|(_, candidate)| candidate.poly)
+}
+
 // --- API types ---
 
 #[derive(Default)]
@@ -1030,6 +1210,73 @@ async fn snap_to_road(
     match index.snap(params.lat, params.lon, search_distance) {
         Some(s) => json_response(&s),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn polygon(offset: u32, area: f32) -> AdminPolygon {
+        AdminPolygon {
+            vertex_offset: offset,
+            vertex_count: 4,
+            name_id: 0,
+            semantic: SEM_STATE,
+            area,
+            country_code: 0,
+        }
+    }
+
+    #[test]
+    fn select_admin_candidate_prefers_compatible_parent_for_border_regression() {
+        let vertices = [
+            NodeCoord { lat: -0.5, lng: -0.5 },
+            NodeCoord { lat: 0.5, lng: -0.5 },
+            NodeCoord { lat: 0.5, lng: 0.5 },
+            NodeCoord { lat: -0.5, lng: 0.5 },
+            NodeCoord { lat: -1.0, lng: -1.0 },
+            NodeCoord { lat: 1.0, lng: -1.0 },
+            NodeCoord { lat: 1.0, lng: 1.0 },
+            NodeCoord { lat: -1.0, lng: 1.0 },
+        ];
+        let wrong = polygon(0, 1.0);
+        let correct = polygon(4, 4.0);
+        let candidates = [
+            AdminCandidate { area: wrong.area, poly: &wrong },
+            AdminCandidate { area: correct.area, poly: &correct },
+        ];
+        // Models the Santa Terezinha/PE border issue: one parent is smaller but
+        // only the compatible branch covers the child support points.
+        let support_points = [(0.0, 0.0), (0.75, 0.75)];
+
+        let selected = select_admin_candidate(&candidates, &vertices, &support_points).unwrap();
+
+        assert_eq!(selected.vertex_offset, correct.vertex_offset);
+    }
+
+    #[test]
+    fn select_admin_candidate_falls_back_to_smallest_area_without_support_points() {
+        let vertices = [
+            NodeCoord { lat: -1.0, lng: -1.0 },
+            NodeCoord { lat: 1.0, lng: -1.0 },
+            NodeCoord { lat: 1.0, lng: 1.0 },
+            NodeCoord { lat: -1.0, lng: 1.0 },
+            NodeCoord { lat: -2.0, lng: -2.0 },
+            NodeCoord { lat: 2.0, lng: -2.0 },
+            NodeCoord { lat: 2.0, lng: 2.0 },
+            NodeCoord { lat: -2.0, lng: 2.0 },
+        ];
+        let small = polygon(0, 1.0);
+        let large = polygon(4, 4.0);
+        let candidates = [
+            AdminCandidate { area: large.area, poly: &large },
+            AdminCandidate { area: small.area, poly: &small },
+        ];
+
+        let selected = select_admin_candidate(&candidates, &vertices, &[]).unwrap();
+
+        assert_eq!(selected.vertex_offset, small.vertex_offset);
     }
 }
 
